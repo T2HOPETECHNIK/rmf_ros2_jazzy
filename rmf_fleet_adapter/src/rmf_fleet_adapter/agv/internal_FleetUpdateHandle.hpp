@@ -381,6 +381,9 @@ public:
   std::shared_ptr<AllocateTasks> calculate_bid;
   rmf_rxcpp::subscription_guard calculate_bid_subscription;
 
+  rclcpp::TimerBase::SharedPtr memory_utilization_timer;
+  std::optional<std::size_t> planner_cache_reset_size;
+
   template<typename... Args>
   static std::shared_ptr<FleetUpdateHandle> make(Args&&... args)
   {
@@ -408,7 +411,8 @@ public:
           self->_pimpl->handle_emergency(msg->data);
         }
       });
-    handle->_pimpl->target_emergency_sub = handle->_pimpl->node->target_emergency_notice()
+    handle->_pimpl->target_emergency_sub =
+      handle->_pimpl->node->target_emergency_notice()
       .observe_on(rxcpp::identity_same_worker(handle->_pimpl->worker))
       .subscribe(
       [w = handle->weak_from_this()](const auto& msg)
@@ -635,6 +639,44 @@ public:
 
     handle->_pimpl->deserialization.event->add(
       "perform_action", validator, deserializer);
+
+    handle->_pimpl->memory_utilization_timer =
+      handle->_pimpl->node->create_wall_timer(
+      std::chrono::minutes(5), [w = handle->weak_from_this()]()
+      {
+        const auto self = w.lock();
+        if (!self)
+          return;
+
+        const auto& planner = *self->_pimpl->planner;
+        const auto audit = planner->cache_audit();
+        std::stringstream ss;
+        ss << audit;
+        RCLCPP_INFO(
+          self->_pimpl->node->get_logger(),
+          "%s",
+          ss.str().c_str());
+
+        const std::optional<std::size_t> reset_size =
+          self->_pimpl->planner_cache_reset_size;
+        if (reset_size.has_value())
+        {
+
+          const std::size_t cache_size_sum = audit.differential_drive_planner_cache_size()
+            + audit.shortest_path_cache_size()
+            + audit.euclidean_heuristic_cache_size();
+
+          if (cache_size_sum > *reset_size)
+          {
+            RCLCPP_INFO(
+              self->_pimpl->node->get_logger(),
+              "Resetting planner cache since it exceeded size limit of %zu",
+              *reset_size);
+            planner->clear_differential_drive_cache();
+            planner->clear_inner_cache();
+          }
+        }
+      });
 
     return handle;
   }
