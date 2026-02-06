@@ -1405,32 +1405,32 @@ void FleetUpdateHandle::Implementation::handle_emergency_by_zone(
   std::shared_ptr<rmf_fleet_msgs::msg::EmergencySignal> emergency_signal)
 {
   auto is_emergency = emergency_signal->is_emergency;
-  if (is_emergency == emergency_active)
-    return;
-
-  emergency_active = is_emergency;
-  if (is_emergency)
-  {
-    update_emergency_planner();
-  }
-
+ 
   for (const auto& [context, _] : task_managers)
   {
     if (emergency_signal->zone_names.empty())
     {
       context->_set_emergency(is_emergency);
     }
-
-    for (const auto& zone_name : emergency_signal->zone_names)
+    else
     {
-      // For the current implementation, the zone is only on a certain level
-      if (context->map() == zone_name)
+      for (const auto& zone_name : emergency_signal->zone_names)
       {
-        context->_set_emergency(is_emergency);
+        RCLCPP_INFO(node->get_logger(),
+            "ZONE CHECK: robot [%s] map: %s, zone: %s",
+            context->name().c_str(), context->map().c_str(), zone_name.c_str());
+ 
+        if (context->map() == zone_name)
+        {
+          RCLCPP_INFO(node->get_logger(),
+            "ZONE MATCH: setting emergency=%d for robot [%s]",
+            is_emergency, context->name().c_str());
+          context->_set_emergency(is_emergency);
+          break;
+        }
       }
     }
   }
-  emergency_publisher.get_subscriber().on_next(is_emergency);
 }
 
 //==============================================================================
