@@ -1405,30 +1405,30 @@ void FleetUpdateHandle::Implementation::handle_emergency_by_zone(
   std::shared_ptr<rmf_fleet_msgs::msg::EmergencySignal> emergency_signal)
 {
   auto is_emergency = emergency_signal->is_emergency;
- 
+
+  // If no zones are specified, the emergency applies to all robots
+  if (emergency_signal->zone_names.empty())
+  {
+    handle_emergency(is_emergency);
+    return;
+  }
+
   for (const auto& [context, _] : task_managers)
   {
-    if (emergency_signal->zone_names.empty())
+    for (const auto& zone_name : emergency_signal->zone_names)
     {
-      context->_set_emergency(is_emergency);
-    }
-    else
-    {
-      for (const auto& zone_name : emergency_signal->zone_names)
+      RCLCPP_INFO(node->get_logger(),
+          "ZONE CHECK: robot [%s] map: %s, zone: %s",
+          context->name().c_str(), context->map().c_str(), zone_name.c_str());
+
+      if (context->map() == zone_name)
       {
         RCLCPP_INFO(node->get_logger(),
-            "ZONE CHECK: robot [%s] map: %s, zone: %s",
-            context->name().c_str(), context->map().c_str(), zone_name.c_str());
- 
-        if (context->map() == zone_name)
-        {
-          RCLCPP_INFO(node->get_logger(),
-            "ZONE MATCH: setting emergency=%d for robot [%s]",
-            is_emergency, context->name().c_str());
-          context->_set_emergency(is_emergency);
-          break;
-        }
-      }
+          "ZONE MATCH: setting emergency=%d for robot [%s]",
+          is_emergency, context->name().c_str());
+        context->_set_emergency(is_emergency);
+        break;
+      } 
     }
   }
 }
