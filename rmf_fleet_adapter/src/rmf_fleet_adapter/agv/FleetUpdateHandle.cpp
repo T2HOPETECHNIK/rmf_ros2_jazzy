@@ -1381,6 +1381,12 @@ void FleetUpdateHandle::Implementation::update_fleet_logs() const
   }
 }
 
+// Forward declaration for is_robot_in_lift (defined below at ~line 1444)
+bool is_robot_in_lift(
+  const agv::RobotContext& context,
+  const rmf_traffic::agv::Graph& graph,
+  double lift_tolerance = 2.0);
+
 void FleetUpdateHandle::Implementation::handle_emergency(
   const bool is_emergency)
 {
@@ -1393,44 +1399,220 @@ void FleetUpdateHandle::Implementation::handle_emergency(
     update_emergency_planner();
   }
 
+  const auto& graph = (*planner)->get_configuration().graph();
+
+  bool any_robot_affected = false;
+  std::vector<std::shared_ptr<RobotContext>> deferred_contexts;
+  
   for (const auto& [context, _] : task_managers)
   {
+    // Skip robots in lift transit - same approach as Code Blue
+    if (is_emergency && is_robot_in_lift(*context, graph))
+    {
+      RCLCPP_INFO(node->get_logger(),
+        "[Emergency - Fire] robot [%s] is in lift transit, deferring check",
+        context->name().c_str());
+      deferred_contexts.push_back(context);
+      continue;
+    }
     context->_set_emergency(is_emergency);
+    any_robot_affected = true;
   }
-  emergency_publisher.get_subscriber().on_next(is_emergency);
+  
+  // Only notify task managers if at least one robot was affected
+  if (any_robot_affected || !is_emergency)
+  {
+    emergency_publisher.get_subscriber().on_next(is_emergency);
+  }
+  
+  // For deferred robots, schedule a simple delayed check
+  // After 60 seconds, apply emergency and send signal
+  if (!deferred_contexts.empty() && is_emergency)
+  {
+    RCLCPP_INFO(node->get_logger(),
+      "[Emergency - Fire] Scheduling delayed emergency for %zu robots in lift",
+      deferred_contexts.size());
+    
+    // Capture what we need safely using pointers
+    auto contexts_copy = deferred_contexts;
+    auto* pub_ptr = &emergency_publisher;
+    auto weak_node = std::weak_ptr<Node>(node);
+    auto* active_flag = &emergency_active;
+    
+    // Use shared_ptr to timer so callback can cancel itself (one-shot)
+    auto timer_ptr = std::make_shared<rclcpp::TimerBase::SharedPtr>();
+    *timer_ptr = node->create_wall_timer(
+      std::chrono::seconds(60),
+      [contexts_copy, pub_ptr, weak_node, active_flag, timer_ptr]()
+      {
+        // Cancel timer immediately to make this one-shot
+        if (*timer_ptr)
+          (*timer_ptr)->cancel();
+        
+        auto n = weak_node.lock();
+        if (!n || !*active_flag)
+          return;
+        
+        RCLCPP_INFO(n->get_logger(),
+          "[Emergency - Fire] Applying deferred emergency to %zu robots",
+          contexts_copy.size());
+        
+        for (const auto& ctx : contexts_copy)
+        {
+          ctx->_set_emergency(true);
+        }
+        pub_ptr->get_subscriber().on_next(true);
+      });
+  }
 }
 
 //==============================================================================
+// Visitor to detect if a lane has lift events
+class LiftLaneDetector : public rmf_traffic::agv::Graph::Lane::Executor
+{
+public:
+  using DoorOpen = rmf_traffic::agv::Graph::Lane::DoorOpen;
+  using DoorClose = rmf_traffic::agv::Graph::Lane::DoorClose;
+  using LiftSessionBegin = rmf_traffic::agv::Graph::Lane::LiftSessionBegin;
+  using LiftSessionEnd = rmf_traffic::agv::Graph::Lane::LiftSessionEnd;
+  using LiftMove = rmf_traffic::agv::Graph::Lane::LiftMove;
+  using LiftDoorOpen = rmf_traffic::agv::Graph::Lane::LiftDoorOpen;
+  using Dock = rmf_traffic::agv::Graph::Lane::Dock;
+  using Wait = rmf_traffic::agv::Graph::Lane::Wait;
+
+  void execute(const DoorOpen&) override {}
+  void execute(const DoorClose&) override {}
+  void execute(const LiftSessionEnd&) override { is_lift = true; }
+  void execute(const LiftMove&) override { is_lift = true; }
+  void execute(const Wait&) override {}
+  void execute(const Dock&) override {}
+  void execute(const LiftSessionBegin&) override { is_lift = true; }
+  void execute(const LiftDoorOpen&) override { is_lift = true; }
+
+  bool is_lift = false;
+};
+
+// Helper: Check if robot is near any lift waypoint (in lift transit)
+// Returns true if robot position is within lift_tolerance of any lift-related waypoint
+bool is_robot_in_lift(
+  const agv::RobotContext& context,
+  const rmf_traffic::agv::Graph& graph,
+  double lift_tolerance)  // default value in forward declaration above
+{
+  // Get robot position
+  if (context.location().empty())
+    return false;
+  
+  const auto& loc = context.location().front();
+  const auto robot_pos = loc.location();
+  if (!robot_pos.has_value())
+    return false;
+  
+  const Eigen::Vector2d robot_xy = robot_pos.value();
+  
+  // Collect all lift waypoint indices
+  std::unordered_set<std::size_t> lift_waypoints;
+  
+  for (std::size_t i = 0; i < graph.num_lanes(); ++i)
+  {
+    const auto& lane = graph.get_lane(i);
+    LiftLaneDetector detector;
+    
+    if (const auto* event = lane.entry().event())
+      event->execute(detector);
+    if (const auto* event = lane.exit().event())
+      event->execute(detector);
+    
+    if (detector.is_lift)
+    {
+      lift_waypoints.insert(lane.entry().waypoint_index());
+      lift_waypoints.insert(lane.exit().waypoint_index());
+    }
+  }
+  
+  // Check distance to all lift waypoints
+  for (const auto wp_idx : lift_waypoints)
+  {
+    const auto& wp = graph.get_waypoint(wp_idx);
+    const double dist = (robot_xy - wp.get_location()).norm();
+    
+    if (dist < lift_tolerance)
+    {
+      return true;
+    }
+  }
+  
+  return false;
+}
+
 void FleetUpdateHandle::Implementation::handle_emergency_by_zone(
   std::shared_ptr<rmf_fleet_msgs::msg::EmergencySignal> emergency_signal)
 {
   auto is_emergency = emergency_signal->is_emergency;
-  if (is_emergency == emergency_active)
-    return;
 
-  emergency_active = is_emergency;
+  // If no zones specified, treat as global emergency (fire alarm behavior)
+  if (emergency_signal->zone_names.empty())
+  {
+    RCLCPP_INFO(node->get_logger(),
+      "[Emergency - Fire] No zones specified, falling back to global emergency=%d",
+      is_emergency);
+    handle_emergency(is_emergency);
+    return;
+  }
+
+  // Zone-based code blue:
+  // 1. Update emergency planner (closes lift lanes)
+  // 2. Set emergency only for robots whose current map matches the zone
+  //    AND who are NOT currently in a lift (lift transit defers the check)
+  // 3. Notify task managers via emergency_publisher so they react
+  
   if (is_emergency)
   {
     update_emergency_planner();
   }
 
+  const auto& graph = (*planner)->get_configuration().graph();
+  
+  bool any_robot_matched = false;
   for (const auto& [context, _] : task_managers)
   {
-    if (emergency_signal->zone_names.empty())
+    // Skip robots in lift transit - they'll be checked again after exiting
+    // This prevents false positives when robot is leaving emergency zone via lift
+    if (is_emergency && is_robot_in_lift(*context, graph))
     {
-      context->_set_emergency(is_emergency);
+      RCLCPP_INFO(node->get_logger(),
+        "[Emergency - CodeBlue] robot [%s] is in lift transit, deferring check",
+        context->name().c_str());
+      continue;
     }
-
+    
     for (const auto& zone_name : emergency_signal->zone_names)
     {
-      // For the current implementation, the zone is only on a certain level
+      RCLCPP_INFO(node->get_logger(),
+        "[Emergency - CodeBlue] robot [%s] current_map=[%s] vs zone=[%s]",
+        context->name().c_str(), context->map().c_str(), zone_name.c_str());
+
       if (context->map() == zone_name)
       {
+        RCLCPP_INFO(node->get_logger(),
+          "[Emergency - CodeBlue] MATCH: setting emergency=%d for robot [%s]",
+          is_emergency, context->name().c_str());
         context->_set_emergency(is_emergency);
+        any_robot_matched = true;
+        break;
       }
     }
   }
-  emergency_publisher.get_subscriber().on_next(is_emergency);
+
+  // CRITICAL: Notify task managers to check emergency state and replan
+  // This triggers the actual behavioral change (cancel task, go to elot)
+  if (any_robot_matched)
+  {
+    RCLCPP_INFO(node->get_logger(),
+      "[Emergency - CodeBlue] Notifying task managers: emergency=%d",
+      is_emergency);
+    emergency_publisher.get_subscriber().on_next(is_emergency);
+  }
 }
 
 //==============================================================================
@@ -1453,7 +1635,10 @@ void FleetUpdateHandle::Implementation::handle_target_emergency(
   }
 
   if (execute) {
-    handle_emergency(emergency_signal->is_emergency);
+    RCLCPP_INFO(node->get_logger(),
+      "[CodeBlue] Fleet [%s] matched, calling handle_emergency_by_zone",
+      name.c_str());
+    handle_emergency_by_zone(emergency_signal);
   }
 }
 
