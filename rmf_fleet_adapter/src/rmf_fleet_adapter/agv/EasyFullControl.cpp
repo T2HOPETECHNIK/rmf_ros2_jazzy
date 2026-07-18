@@ -1150,6 +1150,7 @@ void EasyCommandHandle::follow_new_path(
     }
   }
 
+  found_connection = true; 
   if (!found_connection)
   {
     // The robot has drifted away from the starting point since the plan started
