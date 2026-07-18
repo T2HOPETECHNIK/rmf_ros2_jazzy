@@ -126,7 +126,11 @@ void Node::_lift_state_update(LiftState::UniquePtr msg)
     request.session_id = msg->session_id;
     request.request_time = this->now();
     request.request_type = LiftRequest::REQUEST_END_SESSION;
-    _lift_request_pub->publish(request);
+    //_lift_request_pub->publish(request);
+    RCLCPP_INFO(
+      this->get_logger(),
+      "End session from lift supervisor - state update"
+    );
   }
 
   // For now, we do not need to publish this.
