@@ -1051,6 +1051,12 @@ const LiftDestination* RobotContext::current_lift_destination() const
 }
 
 //==============================================================================
+bool RobotContext::current_lift_destination_arrived() const
+{
+  return _lift_arrived;
+}
+
+//==============================================================================
 std::shared_ptr<void> RobotContext::set_lift_destination(
   std::string lift_name,
   std::string destination_floor,
@@ -1061,6 +1067,7 @@ std::shared_ptr<void> RobotContext::set_lift_destination(
     LiftDestination{
       std::move(lift_name),
       std::move(destination_floor),
+      requester_id(),
       requested_from_inside
     });
   _initial_time_idle_outside_lift = std::nullopt;
@@ -1082,7 +1089,7 @@ void RobotContext::release_lift()
     rmf_lift_msgs::msg::LiftRequest msg;
     msg.lift_name = _lift_destination->lift_name;
     msg.request_type = rmf_lift_msgs::msg::LiftRequest::REQUEST_END_SESSION;
-    msg.session_id = requester_id();
+    msg.session_id = _lift_destination->session_id;
     msg.destination_floor = _lift_destination->destination_floor;
     _node->lift_request()->publish(msg);
   }
@@ -1401,7 +1408,9 @@ void RobotContext::_check_lift_state(
       }
 
       _lift_arrived =
-        _lift_destination->destination_floor == state.current_floor;
+        _lift_destination->destination_floor == state.current_floor &&
+        state.door_state == rmf_lift_msgs::msg::LiftState::DOOR_OPEN &&
+        state.session_id == _lift_destination->session_id;
     }
   }
   else if (_lift_destination && _lift_destination->lift_name == state.lift_name)
@@ -1429,7 +1438,7 @@ void RobotContext::_publish_lift_destination()
   rmf_lift_msgs::msg::LiftRequest msg;
   msg.lift_name = _lift_destination->lift_name;
   msg.destination_floor = _lift_destination->destination_floor;
-  msg.session_id = requester_id();
+  msg.session_id = _lift_destination->session_id;
   msg.request_time = _node->now();
   msg.request_type = rmf_lift_msgs::msg::LiftRequest::REQUEST_AGV_MODE;
   msg.door_state = rmf_lift_msgs::msg::LiftRequest::DOOR_OPEN;

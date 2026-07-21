@@ -97,12 +97,17 @@ void RequestLift::ActivePhase::_init_obs()
 {
   using rmf_lift_msgs::msg::LiftState;
 
-  if (_data.located == Located::Outside && _context->current_lift_destination())
+  const auto current_lift_destination = _context->current_lift_destination();
+  if (_data.located == Located::Outside &&
+    current_lift_destination &&
+    _context->current_lift_destination_arrived())
   {
-    // Check if the current destination is the one we want and also has arrived.
+    // Check if the current destination is the one we want for our session and
+    // has arrived.
     // If so, we can skip the rest of this process and just make an observable
     // that says it's completed right away.
-    if (_context->current_lift_destination()->matches(_lift_name, _destination))
+    if (current_lift_destination->matches(
+      _lift_name, _destination, _context->requester_id()))
     {
       _obs = rxcpp::observable<>::create<LegacyTask::StatusMsg>(
         [w = weak_from_this()](rxcpp::subscriber<LegacyTask::StatusMsg> s)
