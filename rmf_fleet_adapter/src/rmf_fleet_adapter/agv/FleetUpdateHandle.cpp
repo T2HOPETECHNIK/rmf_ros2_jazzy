@@ -2100,7 +2100,7 @@ void FleetUpdateHandle::add_robot(
                       c->node()->get_logger(),
                       "Requesting replan for [%s] because it failed to negotiate",
                       c->requester_id().c_str());
-                    c->request_replan();
+                      c->request_replan();
                   }
                 }
               });

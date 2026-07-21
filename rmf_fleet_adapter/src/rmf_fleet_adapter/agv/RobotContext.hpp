@@ -369,13 +369,17 @@ struct LiftDestination
 {
   std::string lift_name;
   std::string destination_floor;
+  std::string session_id;
   bool requested_from_inside;
 
   inline bool matches(
     const std::string& desired_lift_name,
-    const std::string& desired_floor) const
+    const std::string& desired_floor,
+    const std::string& desired_session_id) const
   {
-    return desired_lift_name == lift_name && desired_floor == destination_floor;
+    return desired_lift_name == lift_name
+      && desired_floor == destination_floor
+      && desired_session_id == session_id;
   }
 };
 
@@ -670,6 +674,9 @@ public:
 
   /// Get the current lift destination request for this robot
   const LiftDestination* current_lift_destination() const;
+
+  /// Check if the current lift destination has arrived
+  bool current_lift_destination_arrived() const;
 
   /// Ask for a certain lift to go to a certain destination and open the doors
   std::shared_ptr<void> set_lift_destination(

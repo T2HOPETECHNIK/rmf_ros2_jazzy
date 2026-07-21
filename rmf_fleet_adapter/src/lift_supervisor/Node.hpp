@@ -25,6 +25,7 @@
 
 #include <rclcpp/node.hpp>
 
+#include <memory>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -53,11 +54,18 @@ private:
   LiftStateSub::SharedPtr _lift_state_sub;
   void _lift_state_update(LiftState::UniquePtr msg);
 
+  void _publish_end_session(LiftRequest::UniquePtr& request);
+
+  void _publish_pending_session(
+    const std::string& lift_name,
+    LiftRequest::UniquePtr& request);
+
   using EmergencyNotice = std_msgs::msg::Bool;
   using EmergencyNoticePub = rclcpp::Publisher<EmergencyNotice>;
   EmergencyNoticePub::SharedPtr _emergency_notice_pub;
 
   std::unordered_map<std::string, LiftRequest::UniquePtr> _active_sessions;
+  std::unordered_map<std::string, LiftRequest::UniquePtr> _pending_sessions;
 };
 
 } // namespace lift_supervisor
