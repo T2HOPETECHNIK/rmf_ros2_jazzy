@@ -1069,7 +1069,7 @@ std::shared_ptr<void> RobotContext::set_lift_destination(
     lift_name.c_str(),
     destination_floor.c_str());
 
-  _lift_arrived = has_lift_arrived(lift_name, destination_floor);
+  _lift_arrived = current_lift_destination_arrived();
 
   _lift_destination = std::make_shared<LiftDestination>(
     LiftDestination{
