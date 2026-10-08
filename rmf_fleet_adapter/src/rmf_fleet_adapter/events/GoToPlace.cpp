@@ -224,28 +224,15 @@ auto GoToPlace::Active::make(
 
       if (self->_execution.has_value())
       {
-        // TODO(@mxgrey): Consider ignoring waypoints that have already been
-        // passed.
-        for (const auto& wp : self->_execution->plan.get_waypoints())
+        if (self->_execution->uses_closed_lanes(
+            changes.closed_lanes, self->_context->itinerary()))
         {
-          for (const std::size_t lane : wp.approach_lanes())
-          {
-            const auto closed = std::find(
-              changes.closed_lanes.begin(),
-              changes.closed_lanes.end(),
-              lane);
-            if (closed != changes.closed_lanes.end())
-            {
-              // The current plan is using (or did use) a lane which has closed,
-              // so let's replan.
-              RCLCPP_INFO(
-                self->_context->node()->get_logger(),
-                "Requesting replan for [%s] to avoid a newly closed lane",
-                self->_context->requester_id().c_str());
-              self->_context->request_replan();
-              return;
-            }
-          }
+          RCLCPP_INFO(
+            self->_context->node()->get_logger(),
+            "Requesting replan for [%s] to avoid a newly closed lane",
+            self->_context->requester_id().c_str());
+          self->_context->request_replan();
+          return;
         }
       }
       else

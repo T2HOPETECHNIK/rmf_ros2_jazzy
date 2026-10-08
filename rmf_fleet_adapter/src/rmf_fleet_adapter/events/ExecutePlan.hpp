@@ -42,8 +42,16 @@ struct ExecutePlan
     std::function<void()> finished,
     std::optional<rmf_traffic::Duration> tail_period);
 
+  /// Check only lanes whose arrival checkpoints have not yet been reached.
+  bool uses_closed_lanes(
+    const std::vector<std::size_t>& closed_lanes,
+    const rmf_traffic::schedule::Participant& participant) const;
+
   rmf_traffic::agv::Plan plan;
   PlanIdPtr plan_id;
+  // Unlike plan_id, this does not change when a lift or mutex wait replaces
+  // the scheduled itinerary. Its checkpoints must not be used for this plan.
+  rmf_traffic::PlanId progress_plan_id;
   rmf_traffic::Time finish_time_estimate;
   rmf_task_sequence::Event::ActivePtr sequence;
 };

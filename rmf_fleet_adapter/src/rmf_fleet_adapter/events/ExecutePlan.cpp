@@ -16,6 +16,8 @@
 */
 
 #include "ExecutePlan.hpp"
+
+#include <algorithm>
 #include "LegacyPhaseShim.hpp"
 #include "WaitForTraffic.hpp"
 #include "WaitUntil.hpp"
@@ -1300,6 +1302,10 @@ std::optional<ExecutePlan> ExecutePlan::make(
     }
   }
 
+  // Beginning a phase can replace the itinerary (e.g. with a lift hold).
+  // Record the ID associated with this plan before starting that phase.
+  const auto progress_plan_id = *plan_id;
+
   auto sequence = rmf_task_sequence::events::Bundle::standby(
     rmf_task_sequence::events::Bundle::Type::Sequence,
     standbys, state, std::move(update))->begin([]() {}, std::move(finished));
@@ -1307,9 +1313,44 @@ std::optional<ExecutePlan> ExecutePlan::make(
   return ExecutePlan{
     std::move(plan),
     plan_id,
+    progress_plan_id,
     finish_time_estimate.value(),
     std::move(sequence)
   };
+}
+
+//==============================================================================
+bool ExecutePlan::uses_closed_lanes(
+  const std::vector<std::size_t>& closed_lanes,
+  const rmf_traffic::schedule::Participant& participant) const
+{
+  const bool matching_plan = participant.current_plan_id() == progress_plan_id;
+  const auto& reached = participant.reached();
+  for (const auto& wp : plan.get_waypoints())
+  {
+    const auto& arrivals = wp.arrival_checkpoints();
+    const bool arrived = matching_plan && !arrivals.empty()
+      && std::all_of(arrivals.begin(), arrivals.end(),
+        [&reached](const auto& checkpoint)
+        {
+          return checkpoint.route_id < reached.size()
+            && reached[checkpoint.route_id] >= checkpoint.checkpoint_id;
+        });
+
+    if (arrived)
+      continue;
+
+    for (const auto lane : wp.approach_lanes())
+    {
+      if (std::find(closed_lanes.begin(), closed_lanes.end(), lane)
+        != closed_lanes.end())
+      {
+        return true;
+      }
+    }
+  }
+
+  return false;
 }
 
 } // namespace events
