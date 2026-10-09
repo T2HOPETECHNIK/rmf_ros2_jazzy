@@ -698,10 +698,22 @@ public:
   const std::unordered_map<std::string, TimeMsg>&
   requesting_mutex_groups() const;
 
-  /// Set the mutex group that this robot needs to lock.
-  const rxcpp::observable<std::string>& request_mutex_groups(
+  struct MutexGroupRequest
+  {
+    std::size_t id;
+    rxcpp::observable<std::string> updates;
+  };
+
+  /// Request mutex groups on the worker. A newer request for a group supersedes
+  /// its previous request owner, while preserving its place in the queue.
+  MutexGroupRequest request_mutex_groups(
     std::unordered_set<std::string> groups,
     rmf_traffic::Time claim_time);
+
+  /// Withdraw only pending groups still owned by this request. Acquired locks
+  /// and groups requested by a replacement execution are preserved.
+  /// Call this on the worker, like request_mutex_groups().
+  void cancel_mutex_group_request(std::size_t request_id);
 
   /// Retain only the mutex groups listed in the set. Release all others.
   void retain_mutex_groups(const std::unordered_set<std::string>& groups);
@@ -911,6 +923,8 @@ private:
   void _publish_mutex_group_requests();
   void _handle_mutex_group_manual_release(
     const rmf_fleet_msgs::msg::MutexGroupManualRelease& msg);
+  std::size_t _next_mutex_group_request_id = 0;
+  std::unordered_map<std::string, std::size_t> _mutex_group_request_owners;
   std::unordered_map<std::string, TimeMsg> _requesting_mutex_groups;
   std::unordered_map<std::string, TimeMsg> _locked_mutex_groups;
   rxcpp::subjects::subject<std::string> _mutex_group_lock_subject;
