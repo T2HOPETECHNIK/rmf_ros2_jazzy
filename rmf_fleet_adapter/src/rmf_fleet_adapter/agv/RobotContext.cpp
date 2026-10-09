@@ -1129,13 +1129,18 @@ RobotContext::requesting_mutex_groups() const
 }
 
 //==============================================================================
-const rxcpp::observable<std::string>& RobotContext::request_mutex_groups(
+auto RobotContext::request_mutex_groups(
   std::unordered_set<std::string> groups,
-  rmf_traffic::Time claim_time)
+  rmf_traffic::Time claim_time) -> MutexGroupRequest
 {
+  const auto request_id = _next_mutex_group_request_id++;
   const auto t = rmf_traffic_ros2::convert(claim_time);
   for (const auto& group : groups)
   {
+    if (_locked_mutex_groups.count(group) > 0)
+      continue;
+
+    _mutex_group_request_owners[group] = request_id;
     const auto [it, inserted] = _requesting_mutex_groups.insert({group, t});
     if (!inserted)
     {
@@ -1146,7 +1151,34 @@ const rxcpp::observable<std::string>& RobotContext::request_mutex_groups(
   }
 
   _publish_mutex_group_requests();
-  return _mutex_group_lock_obs;
+  return MutexGroupRequest{request_id, _mutex_group_lock_obs};
+}
+
+//==============================================================================
+void RobotContext::cancel_mutex_group_request(std::size_t request_id)
+{
+  for (auto it = _mutex_group_request_owners.begin();
+    it != _mutex_group_request_owners.end(); )
+  {
+    if (it->second != request_id)
+    {
+      ++it;
+      continue;
+    }
+
+    const auto pending = _requesting_mutex_groups.find(it->first);
+    if (pending != _requesting_mutex_groups.end())
+    {
+      // Never release a lock that has already been acquired. Its release is
+      // governed by the robot's movement out of the protected resource.
+      if (_locked_mutex_groups.count(pending->first) == 0)
+        _release_mutex_group(MutexGroupData{pending->first, pending->second});
+
+      _requesting_mutex_groups.erase(pending);
+    }
+
+    it = _mutex_group_request_owners.erase(it);
+  }
 }
 
 //==============================================================================
@@ -1541,6 +1573,7 @@ void RobotContext::_check_mutex_groups(
     if (_requesting_mutex_groups.count(assignment.group) > 0)
     {
       _requesting_mutex_groups.erase(assignment.group);
+      _mutex_group_request_owners.erase(assignment.group);
       _locked_mutex_groups[assignment.group] = assignment.claim_time;
       _mutex_group_lock_subject.get_subscriber().on_next(assignment.group);
     }
@@ -1576,6 +1609,7 @@ void RobotContext::_retain_mutex_groups(
   {
     _release_mutex_group(data);
     groups.erase(data.name);
+    _mutex_group_request_owners.erase(data.name);
   }
 }
 
@@ -1628,6 +1662,7 @@ void RobotContext::_publish_mutex_group_requests()
           _release_mutex_group(MutexGroupData{name, time});
         }
         _requesting_mutex_groups.clear();
+        _mutex_group_request_owners.clear();
 
         for (const auto& [name, time] : _locked_mutex_groups)
         {

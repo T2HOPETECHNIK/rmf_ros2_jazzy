@@ -99,6 +99,22 @@ auto LockMutexGroup::Active::make(
 }
 
 //==============================================================================
+LockMutexGroup::Active::~Active()
+{
+  if (_mutex_request_id)
+  {
+    // An execution can be discarded without cancel() when it is replanned.
+    // Serialize cleanup with new requests and mutex state updates. The request
+    // ID prevents this cleanup from withdrawing a replacement's request.
+    _context->worker().schedule(
+      [context = _context, id = *_mutex_request_id](const auto&)
+      {
+        context->cancel_mutex_group_request(id);
+      });
+  }
+}
+
+//==============================================================================
 auto LockMutexGroup::Active::state() const -> ConstStatePtr
 {
   return _state;
@@ -130,13 +146,34 @@ auto LockMutexGroup::Active::interrupt(
 //==============================================================================
 void LockMutexGroup::Active::cancel()
 {
+  if (_cancelled)
+    return;
+
+  _cancelled = true;
+  _listener.get().unsubscribe();
+  _plan_subscription.get().unsubscribe();
+  _delay_timer.reset();
+  _find_path_timeout.reset();
+  if (_find_path_service)
+    _find_path_service->interrupt();
+
+  _stubborn.reset();
+  if (_mutex_request_id)
+  {
+    _context->cancel_mutex_group_request(*_mutex_request_id);
+    _mutex_request_id.reset();
+  }
+
   _state->update_status(Status::Canceled);
-  const auto finished = _finished;
+  const auto finished = std::move(_finished);
   _finished = nullptr;
-  _context->worker().schedule([finished](const auto&)
-    {
-      finished();
-    });
+  if (finished)
+  {
+    _context->worker().schedule([finished](const auto&)
+      {
+        finished();
+      });
+  }
 }
 
 //==============================================================================
@@ -176,10 +213,17 @@ void LockMutexGroup::Active::_initialize()
     // We don't need to do anything further, we already got the mutex group
     // previously.
     _context->worker().schedule(
-      [state = _state, finished = _finished](const auto&)
+      [weak = weak_from_this()](const auto&)
       {
-        state->update_status(State::Status::Completed);
-        finished();
+        const auto self = weak.lock();
+        if (!self || self->_cancelled)
+          return;
+
+        self->_state->update_status(State::Status::Completed);
+        const auto finished = std::move(self->_finished);
+        self->_finished = nullptr;
+        if (finished)
+          finished();
       });
     return;
   }
@@ -209,29 +253,31 @@ void LockMutexGroup::Active::_initialize()
     [weak = weak_from_this(), plan_id = *_data.plan_id]()
     {
       const auto self = weak.lock();
-      if (!self)
+      if (!self || self->_cancelled)
         return;
 
       self->_apply_cumulative_delay();
     });
 
-  _listener = _context->request_mutex_groups(
-    _data.mutex_groups, _data.hold_time)
+  const auto request = _context->request_mutex_groups(
+    _remaining, _data.hold_time);
+  _mutex_request_id = request.id;
+  _listener = request.updates
     .observe_on(rxcpp::identity_same_worker(_context->worker()))
     .subscribe([w = weak_from_this()](const std::string& locked)
       {
         const auto self = w.lock();
-        if (!self)
+        if (!self || self->_cancelled)
           return;
 
         self->_remaining.erase(locked);
         if (self->_remaining.empty())
         {
           const auto finished = self->_finished;
-          self->_finished = nullptr;
           if (!finished)
             return;
 
+          self->_listener.get().unsubscribe();
           const auto now = self->_context->now();
           const auto delay = now - self->_data.hold_time;
           if (delay > std::chrono::seconds(2))
@@ -273,9 +319,10 @@ void LockMutexGroup::Active::_initialize()
                   const services::FindPath::Result& result)
                 {
                   const auto self = w.lock();
-                  if (!self)
+                  if (!self || self->_cancelled)
                     return;
 
+                  self->_finished = nullptr;
                   if (self->_consider_plan_result(result))
                   {
                     // We have a matching plan so proceed
@@ -325,6 +372,7 @@ void LockMutexGroup::Active::_initialize()
           self->_schedule(*self->_data.resume_itinerary);
           self->_apply_cumulative_delay();
           self->_state->update_status(Status::Completed);
+          self->_finished = nullptr;
           finished();
           return;
         }

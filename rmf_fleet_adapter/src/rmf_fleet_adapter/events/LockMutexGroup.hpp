@@ -81,6 +81,8 @@ public:
       std::function<void()> finished,
       Data data);
 
+    ~Active() override;
+
     ConstStatePtr state() const final;
 
     rmf_traffic::Duration remaining_time_estimate() const final;
@@ -107,6 +109,8 @@ public:
     std::shared_ptr<void> _stubborn;
     Data _data;
     std::unordered_set<std::string> _remaining;
+    std::optional<std::size_t> _mutex_request_id;
+    bool _cancelled = false;
     rmf_rxcpp::subscription_guard _plan_subscription;
     std::shared_ptr<services::FindPath> _find_path_service;
     rclcpp::TimerBase::SharedPtr _find_path_timeout;
