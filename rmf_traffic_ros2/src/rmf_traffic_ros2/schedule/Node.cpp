@@ -843,7 +843,7 @@ void ScheduleNode::cull()
     std::vector<std::size_t> cull_wait;
     for (const auto& [v, wait] : active_conflicts._waiting)
     {
-      if (wait.conclusion_time + std::chrono::seconds(30) > time)
+      if (wait.conclusion_time + std::chrono::seconds(30) <= time)
       {
         cull_wait.push_back(v);
       }
@@ -853,8 +853,9 @@ void ScheduleNode::cull()
     {
       RCLCPP_WARN(
         get_logger(),
-        "Forcibly ending the wait period for negotiation [%lu] because it has "
-        "timed out.", c);
+        "Forcibly ending the wait for participant [%lu] in negotiation [%lu] "
+        "because it has timed out.",
+        c, active_conflicts._waiting.at(c).negotiation_version);
       active_conflicts._waiting.erase(c);
     }
 
@@ -864,7 +865,7 @@ void ScheduleNode::cull()
       if (open.has_value())
       {
         // TODO(MXG): Make this deadline configurable
-        if (open->last_active_time + std::chrono::seconds(30) > time)
+        if (open->last_active_time + std::chrono::seconds(30) <= time)
         {
           cull_negotiation.push_back(v);
         }
