@@ -130,3 +130,62 @@ SCENARIO("Auctioneer Winner Evaluator", "[Evaluator]")
 
 } // namespace bidding
 } // namespace rmf_task_ros2
+
+using namespace rmf_task_ros2::bidding;
+
+TEST_CASE("Auctioneer ignores responses outside the active auction",
+  "[late_bid_response]")
+{
+  const bool has_proposal = GENERATE(false, true);
+  const auto context = std::make_shared<rclcpp::Context>();
+  context->init(0, nullptr);
+  const auto node = rclcpp::Node::make_shared(
+    "late_bid_response", rclcpp::NodeOptions().context(context));
+  Auctioneer::Implementation auction(
+    node->get_node_base_interface(), node->get_node_clock_interface(),
+    node->get_node_logging_interface(), node->get_node_timers_interface(),
+    node->get_node_topics_interface(), node->get_node_parameters_interface(),
+    nullptr, nullptr);
+  Response response{std::nullopt, {"planning timed out"}};
+  if (has_proposal)
+    response = Response{Response::Proposal{
+        "fleet", "robot", 0.0, 1.0, rmf_traffic_ros2::convert(node->now())}, {}};
+  const auto first_response = convert(response, "first");
+
+  // Includes unsolicited responses and a response after the final bid is popped.
+  auction.receive_response(first_response);
+  CHECK(auction.open_bid_queue.empty());
+
+  BidNoticeMsg notice;
+  notice.task_id = "first";
+  notice.time_window.sec = 5;
+  auction.request_bid(notice);
+  auction.receive_response(first_response);
+  CHECK(auction.open_bid_queue.front().responses.empty());
+  auction.finish_bidding_process();
+  auction.receive_response(convert(response, "unmatched"));
+  CHECK(auction.open_bid_queue.front().responses.empty());
+  auction.receive_response(first_response);
+  CHECK(auction.open_bid_queue.front().responses.size() == 1);
+
+  // Expired, but the periodic closure callback has not run yet.
+  auction.open_bid_queue.front().start_time =
+    node->now() - rclcpp::Duration::from_seconds(10.0);
+  auction.receive_response(first_response);
+  CHECK(auction.open_bid_queue.front().responses.size() == 1);
+  auction.finish_bidding_process();
+  REQUIRE(auction.open_bid_queue.empty());
+  auction.receive_response(first_response);
+  CHECK(auction.open_bid_queue.empty());
+
+  // An old response must not be attributed to the next auction either.
+  notice.task_id = "second";
+  auction.request_bid(notice);
+  auction.bidding_in_process = false;
+  auction.finish_bidding_process();
+  auction.receive_response(first_response);
+  CHECK(auction.open_bid_queue.front().responses.empty());
+  auction.receive_response(convert(response, "second"));
+  CHECK(auction.open_bid_queue.front().responses.size() == 1);
+  rclcpp::shutdown(context);
+}

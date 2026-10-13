@@ -26,6 +26,8 @@
 #include "internal_FleetUpdateHandle.hpp"
 #include "internal_RobotUpdateHandle.hpp"
 #include "RobotContext.hpp"
+#include "../services/TaskPlanningDeadline.hpp"
+#include "../services/BidDeadline.hpp"
 
 #include "../log_to_json.hpp"
 #include "../tasks/Delivery.hpp"
@@ -319,13 +321,36 @@ public:
   void operator()(const Subscriber& s)
   {
     std::vector<std::string> errors;
-    auto assignments = run(errors);
+    auto assignments = run(errors, [s]() { return !s.is_subscribed(); });
     s.on_next(Result{std::move(assignments), std::move(errors)});
     s.on_completed();
   }
 
-  std::optional<TaskAssignments> run(std::vector<std::string>& errors)
+  std::optional<TaskAssignments> run(
+    std::vector<std::string>& errors,
+    std::function<bool()> cancelled = nullptr)
   {
+    auto options = task_planner.default_options();
+    services::TaskPlanningDeadline deadline(
+      planning_deadline.value_or(
+        services::TaskPlanningDeadline::Clock::now() + std::chrono::seconds(10)),
+      [previous = options.interrupter(), cancelled]()
+      {
+        return (previous && previous()) || (cancelled && cancelled());
+      });
+    const auto interrupted = [&]() -> std::optional<TaskAssignments>
+      {
+        const std::string message = "Task allocation interrupted or exceeded its "
+          "planning deadline; no assignments were applied.";
+        RCLCPP_WARN(node->get_logger(), "%s", message.c_str());
+        errors.push_back(make_error_str(19, "Planning interrupted", message));
+        return std::nullopt;
+      };
+
+    // Include time spent queued behind another allocation or reassignment.
+    if (deadline.interrupted())
+      return interrupted();
+
     std::string id = "";
 
     if (new_request)
@@ -348,11 +373,18 @@ public:
       states.push_back(state);
     }
 
-    // Generate new task assignments
+    options.interrupter([deadline]() { return deadline.interrupted(); });
+
+    // TaskPlanner checks the interrupter between search expansions. Its deadline
+    // is cooperative; an individual estimate may still take longer.
     const auto result = task_planner.plan(
       rmf_traffic_ros2::convert(node->now()),
       states,
-      expect.pending_requests);
+      expect.pending_requests,
+      options);
+
+    if (deadline.interrupted())
+      return interrupted();
 
     auto assignments_ptr = std::get_if<
       rmf_task::TaskPlanner::Assignments>(&result);
@@ -451,6 +483,9 @@ public:
     // Do nothing
   }
 
+  // Bids carry an absolute deadline from receipt. Reassignments have no auction
+  // window and instead receive a ten-second budget when execution starts.
+  std::optional<services::TaskPlanningDeadline::Clock::time_point> planning_deadline;
   rmf_task::ConstRequestPtr new_request;
   Expectations expect;
   rmf_task::TaskPlanner task_planner;
@@ -460,8 +495,24 @@ public:
 //==============================================================================
 void FleetUpdateHandle::Implementation::bid_notice_cb(
   const BidNoticeMsg& bid_notice,
-  rmf_task_ros2::bidding::AsyncBidder::Respond respond)
+  rmf_task_ros2::bidding::AsyncBidder::Respond respond_callback)
 {
+  const services::BidDeadline bid_deadline(
+    services::BidDeadline::Clock::now(),
+    std::chrono::seconds(bid_notice.time_window.sec)
+    + std::chrono::nanoseconds(bid_notice.time_window.nanosec));
+  const auto respond = [callback = std::move(respond_callback), bid_deadline](
+    const rmf_task_ros2::bidding::Response& response)
+    {
+      // Check at publication, including validation failures and planner errors.
+      if (!bid_deadline.can_respond())
+        return false;
+      callback(response);
+      return true;
+    };
+  if (!bid_deadline.can_plan())
+    return;
+
   // TODO(YV): Consider moving these checks into convert()
   const auto& task_id = bid_notice.task_id;
   if (task_managers.empty())
@@ -515,11 +566,12 @@ void FleetUpdateHandle::Implementation::bid_notice_cb(
       e.what(),
       request_msg.dump(2, ' ').c_str());
 
-    return respond(
+    respond(
       {
         std::nullopt,
         {make_error_str(5, "Invalid request format", e.what())}
       });
+    return;
   }
 
   // If a fleet_name was specified in the request, only proceed if the value matches
@@ -538,11 +590,12 @@ void FleetUpdateHandle::Implementation::bid_notice_cb(
   const auto new_request = convert(task_id, request_msg, errors);
   if (!new_request)
   {
-    return respond(
+    respond(
       {
         std::nullopt,
         errors
       });
+    return;
   }
 
   calculate_bid = std::make_shared<AllocateTasks>(
@@ -550,17 +603,24 @@ void FleetUpdateHandle::Implementation::bid_notice_cb(
     aggregate_expectations(),
     *task_planner,
     node);
+  calculate_bid->planning_deadline = bid_deadline.planning_deadline();
 
-  auto receive_allocation = [w = weak_self, respond, task_id](
+  auto receive_allocation = [w = weak_self, respond, task_id, bid_deadline](
     AllocateTasks::Result result)
     {
       const auto self = w.lock();
       if (!self)
         return;
 
+      if (!bid_deadline.can_respond())
+        return;
+
       auto allocation_result = result.assignments;
       if (!allocation_result.has_value())
-        return respond({std::nullopt, std::move(result.errors)});
+      {
+        respond({std::nullopt, std::move(result.errors)});
+        return;
+      }
 
       const auto& assignments = allocation_result.value();
 
@@ -622,11 +682,12 @@ void FleetUpdateHandle::Implementation::bid_notice_cb(
             "Failed to find robot_name or finish_time after allocating task. "
             "Please report this bug to the RMF developers."));
 
-        return respond({std::nullopt, std::move(result.errors)});
+        respond({std::nullopt, std::move(result.errors)});
+        return;
       }
 
-      // Publish BidProposal
-      respond(
+      // Result processing may have consumed the remaining publication budget.
+      if (!respond(
         {
           rmf_task_ros2::bidding::Response::Proposal{
             self->_pimpl->name,
@@ -636,7 +697,8 @@ void FleetUpdateHandle::Implementation::bid_notice_cb(
             *finish_time
           },
           std::move(result.errors)
-        });
+        }))
+        return;
 
       RCLCPP_INFO(
         self->_pimpl->node->get_logger(),
@@ -647,8 +709,15 @@ void FleetUpdateHandle::Implementation::bid_notice_cb(
       self->_pimpl->bid_notice_assignments.insert({task_id, assignments});
     };
 
-  calculate_bid_subscription = rmf_rxcpp::make_job<AllocateTasks::Result>(
-    calculate_bid)
+  calculate_bid_subscription = rxcpp::observable<>::create<AllocateTasks::Result>(
+    [job = calculate_bid, planning_worker = reassignment_worker](const auto& s)
+    {
+      planning_worker.schedule([job, s](const auto&)
+        {
+          if (s.is_subscribed())
+            (*job)(s);
+        });
+    })
     .observe_on(rxcpp::identity_same_worker(worker))
     .subscribe(receive_allocation);
 }

@@ -392,7 +392,8 @@ public:
       Implementation{handle, std::forward<Args>(args)...});
 
     handle->_pimpl->reassignment_worker =
-      rxcpp::schedulers::make_event_loop().create_worker();
+      // Allocation must not share an event-loop thread with robot callbacks.
+      rxcpp::schedulers::make_new_thread().create_worker();
 
     handle->_pimpl->add_standard_tasks();
 

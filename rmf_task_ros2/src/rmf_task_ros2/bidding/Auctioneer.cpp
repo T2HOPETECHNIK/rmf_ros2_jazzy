@@ -103,7 +103,17 @@ void Auctioneer::Implementation::request_bid(
 //==============================================================================
 void Auctioneer::Implementation::receive_response(const BidResponseMsg& msg)
 {
+  // A bidder may respond after the final auction was popped, or after its
+  // deadline but before the timer callback runs. Neither response is valid.
+  if (open_bid_queue.empty() || !bidding_in_process)
+    return;
+
+  const auto& bid = open_bid_queue.front();
   const auto id = msg.task_id;
+  if (bid.bid_notice.task_id != id
+    || node_clock_interface->get_clock()->now() - bid.start_time
+    >= bid.bid_notice.time_window)
+    return;
 
   const auto response = convert(msg);
   if (response.proposal.has_value())
@@ -121,10 +131,7 @@ void Auctioneer::Implementation::receive_response(const BidResponseMsg& msg)
       response.errors.size());
   }
 
-  // check if bidding task is initiated by the auctioneer previously
-  // add submited proposal to the current bidding tasks list
-  if (open_bid_queue.front().bid_notice.task_id == id)
-    open_bid_queue.front().responses.push_back(response);
+  open_bid_queue.front().responses.push_back(response);
 }
 
 //==============================================================================
