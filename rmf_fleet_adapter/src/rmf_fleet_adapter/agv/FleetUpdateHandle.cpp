@@ -26,6 +26,7 @@
 #include "internal_FleetUpdateHandle.hpp"
 #include "internal_RobotUpdateHandle.hpp"
 #include "RobotContext.hpp"
+#include "../services/TaskPlanningDeadline.hpp"
 
 #include "../log_to_json.hpp"
 #include "../tasks/Delivery.hpp"
@@ -319,12 +320,14 @@ public:
   void operator()(const Subscriber& s)
   {
     std::vector<std::string> errors;
-    auto assignments = run(errors);
+    auto assignments = run(errors, [s]() { return !s.is_subscribed(); });
     s.on_next(Result{std::move(assignments), std::move(errors)});
     s.on_completed();
   }
 
-  std::optional<TaskAssignments> run(std::vector<std::string>& errors)
+  std::optional<TaskAssignments> run(
+    std::vector<std::string>& errors,
+    std::function<bool()> cancelled = nullptr)
   {
     std::string id = "";
 
@@ -348,11 +351,30 @@ public:
       states.push_back(state);
     }
 
-    // Generate new task assignments
+    auto options = task_planner.default_options();
+    services::TaskPlanningDeadline deadline(planning_timeout,
+      [previous = options.interrupter(), cancelled]()
+      {
+        return (previous && previous()) || (cancelled && cancelled());
+      });
+    options.interrupter([deadline]() { return deadline.interrupted(); });
+
+    // TaskPlanner checks the interrupter between search expansions. Its deadline
+    // is cooperative; an individual estimate may still take longer.
     const auto result = task_planner.plan(
       rmf_traffic_ros2::convert(node->now()),
       states,
-      expect.pending_requests);
+      expect.pending_requests,
+      options);
+
+    if (deadline.interrupted())
+    {
+      const std::string message = "Task allocation interrupted or exceeded its "
+        "planning deadline; no assignments were applied.";
+      RCLCPP_WARN(node->get_logger(), "%s", message.c_str());
+      errors.push_back(make_error_str(19, "Planning interrupted", message));
+      return std::nullopt;
+    }
 
     auto assignments_ptr = std::get_if<
       rmf_task::TaskPlanner::Assignments>(&result);
@@ -451,6 +473,8 @@ public:
     // Do nothing
   }
 
+  // Also bounds reassignment, which does not have a bidding time window.
+  std::chrono::steady_clock::duration planning_timeout = std::chrono::seconds(10);
   rmf_task::ConstRequestPtr new_request;
   Expectations expect;
   rmf_task::TaskPlanner task_planner;
@@ -550,6 +574,11 @@ void FleetUpdateHandle::Implementation::bid_notice_cb(
     aggregate_expectations(),
     *task_planner,
     node);
+  const auto bid_window = std::chrono::seconds(bid_notice.time_window.sec)
+    + std::chrono::nanoseconds(bid_notice.time_window.nanosec);
+  if (bid_window > std::chrono::nanoseconds::zero())
+    calculate_bid->planning_timeout = std::min(calculate_bid->planning_timeout,
+      std::chrono::duration_cast<std::chrono::steady_clock::duration>(bid_window));
 
   auto receive_allocation = [w = weak_self, respond, task_id](
     AllocateTasks::Result result)
@@ -647,8 +676,15 @@ void FleetUpdateHandle::Implementation::bid_notice_cb(
       self->_pimpl->bid_notice_assignments.insert({task_id, assignments});
     };
 
-  calculate_bid_subscription = rmf_rxcpp::make_job<AllocateTasks::Result>(
-    calculate_bid)
+  calculate_bid_subscription = rxcpp::observable<>::create<AllocateTasks::Result>(
+    [job = calculate_bid, planning_worker = reassignment_worker](const auto& s)
+    {
+      planning_worker.schedule([job, s](const auto&)
+        {
+          if (s.is_subscribed())
+            (*job)(s);
+        });
+    })
     .observe_on(rxcpp::identity_same_worker(worker))
     .subscribe(receive_allocation);
 }

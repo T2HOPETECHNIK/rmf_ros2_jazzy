@@ -18,6 +18,8 @@
 #include "MockAdapterFixture.hpp"
 
 #include <events/LockMutexGroup.hpp>
+#include <agv/internal_FleetUpdateHandle.hpp>
+#include <services/TaskPlanningDeadline.hpp>
 #include <rmf_fleet_adapter/StandardNames.hpp>
 #include <rmf_utils/catch.hpp>
 
@@ -184,4 +186,77 @@ TEST_CASE_METHOD(MockAdapterFixture,
     CHECK(robot.schedule_and_wait<bool>([&]()
       { return context->locked_mutex_groups().count("occupied") == 1; }));
   }
+}
+
+TEST_CASE("Task allocation deadlines preserve interruption across copies",
+  "[task_allocation]")
+{
+  using rmf_fleet_adapter::services::TaskPlanningDeadline;
+  TaskPlanningDeadline expired(0s);
+  CHECK(expired.interrupted());
+  bool cancel = false;
+  TaskPlanningDeadline deadline(10s, [&]() { return cancel; });
+  const auto copy = deadline;
+  CHECK_FALSE(copy.interrupted());
+  cancel = true;
+  CHECK(copy.interrupted());
+  cancel = false;
+  CHECK(deadline.interrupted());
+}
+
+TEST_CASE_METHOD(MockAdapterFixture,
+  "Task allocation worker does not block mutex heartbeats",
+  "[task_allocation]")
+{
+  using namespace rmf_fleet_adapter;
+  const auto robot = add_robot();
+  const auto context = robot.context;
+  auto messages = std::make_shared<std::atomic<int>>(0);
+  auto subscription = data->ros_node->create_subscription<Requests::Message>(
+    MutexGroupRequestTopicName, rclcpp::QoS(100).reliable().transient_local(),
+    [messages](Requests::Message::ConstSharedPtr msg)
+    { if (msg->group == "heartbeat" && msg->mode == Requests::Message::MODE_LOCK) ++*messages; });
+  REQUIRE(wait_for([&]()
+    { return context->node()->mutex_group_request()->get_subscription_count() > 0; }));
+  robot.schedule_and_wait<bool>([&]()
+    {
+      context->current_task_id("busy_planner_test");
+      context->request_mutex_groups({"heartbeat"}, context->now());
+      return true;
+    });
+  REQUIRE(wait_for([&]() { return messages->load() > 0; }));
+  const int before = messages->load();
+  auto started = std::make_shared<std::atomic_bool>(false);
+  auto done = std::make_shared<std::atomic_bool>(false);
+  auto& impl = agv::FleetUpdateHandle::Implementation::get(*data->fleet);
+  auto thread_promise = std::make_shared<std::promise<std::thread::id>>();
+  auto thread_future = thread_promise->get_future();
+  impl.reassignment_worker.schedule([thread_promise](const auto&)
+    { thread_promise->set_value(std::this_thread::get_id()); });
+  REQUIRE(thread_future.wait_for(5s) == std::future_status::ready);
+  const auto allocation_thread = thread_future.get();
+  // Exercise every thread in RxCpp's shared pool. A dedicated allocation
+  // worker must not coincide with any of these callback threads.
+  const auto pool_size = std::max(std::thread::hardware_concurrency(), 4u);
+  for (unsigned i = 0; i < pool_size; ++i)
+  {
+    auto promise = std::make_shared<std::promise<std::thread::id>>();
+    auto future = promise->get_future();
+    auto pool_worker = rxcpp::schedulers::make_event_loop().create_worker();
+    pool_worker.schedule([promise](const auto&)
+      { promise->set_value(std::this_thread::get_id()); });
+    REQUIRE(future.wait_for(5s) == std::future_status::ready);
+    CHECK(future.get() != allocation_thread);
+  }
+  impl.reassignment_worker.schedule([started, done](const auto&)
+    {
+      started->store(true);
+      // Simulates an expensive estimate that cannot check its interrupter.
+      std::this_thread::sleep_for(4s);
+      done->store(true);
+    });
+  REQUIRE(wait_for([&]() { return started->load(); }));
+  REQUIRE(wait_for([&]() { return messages->load() > before; }));
+  CHECK_FALSE(done->load());
+  REQUIRE(wait_for([&]() { return done->load(); }));
 }
