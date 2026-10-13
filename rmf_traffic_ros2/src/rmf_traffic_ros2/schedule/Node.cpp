@@ -742,12 +742,21 @@ void ScheduleNode::setup_conflict_topics_and_thread()
         auto conflicts = get_conflicts(
           view_changes, mirror, filter, deferred_conflicts);
 
+        // Pairs promoted from deferred_conflicts by the recheck below, in the
+        // same order as their entries in conflicts starting at first_promoted.
+        std::vector<ParticipantPair> promoted;
+        std::size_t first_promoted = conflicts.size();
         if (recheck_due)
         {
           next_deferred_recheck =
             std::chrono::steady_clock::now() + deferred_conflict_recheck_period;
           auto due = recheck_deferred_conflicts(
             deferred_conflicts, mirror, filter);
+          for (const auto& c : due)
+          {
+            promoted.push_back(
+              make_pair_key(*c.begin(), *std::next(c.begin())));
+          }
           conflicts.insert(conflicts.end(), due.begin(), due.end());
         }
 
@@ -791,15 +800,23 @@ void ScheduleNode::setup_conflict_topics_and_thread()
         }
 
         std::unordered_map<Version, const Negotiation*> new_negotiations;
-        for (const auto& conflict : conflicts)
+        for (std::size_t i = 0; i < conflicts.size(); ++i)
         {
           std::unique_lock<std::mutex> lock(active_conflicts_mutex);
           const auto new_negotiation = active_conflicts.insert(
-            conflict, rmf_traffic_ros2::convert(now()), mirror);
+            conflicts[i], rmf_traffic_ros2::convert(now()), mirror);
 
           if (new_negotiation)
           {
             new_negotiations[new_negotiation->first] = new_negotiation->second;
+          }
+          else if (i >= first_promoted)
+          {
+            // The negotiation could not be opened yet, e.g. a participant is
+            // still waiting to acknowledge a previous negotiation. Nothing may
+            // change its itinerary to rediscover this pair, so keep deferring
+            // it and let the next recheck try again.
+            deferred_conflicts.insert(promoted[i - first_promoted]);
           }
         }
 
