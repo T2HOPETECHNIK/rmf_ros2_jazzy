@@ -299,6 +299,11 @@ void MoveRobot::Action::operator()(const Subscriber& s)
               const auto adjusted_now = now - new_cumulative_delay;
               const auto& graph = context->navigation_graph();
               std::unordered_set<std::string> retain_mutexes;
+              const Eigen::Vector3d robot_p3 = context->position();
+              const Eigen::Vector2d robot_p(robot_p3.x(), robot_p3.y());
+              const double footprint_radius =
+                context->profile()->footprint()->get_characteristic_length();
+              bool next_waypoint = true;
               for (const auto& wp : self->_waypoints)
               {
                 const auto s_100 =
@@ -316,11 +321,29 @@ void MoveRobot::Action::operator()(const Subscriber& s)
                     graph.get_waypoint(*wp.graph_index()).in_mutex_group());
                 }
 
+                // The planner merges straight lanes into one waypoint, so the
+                // approach lanes of the waypoint the robot is heading to can
+                // include lanes it has already driven through. Release those
+                // once the robot's footprint is clear of their exit.
+                const Eigen::Vector3d wp_p3 = wp.position();
+                const Eigen::Vector2d wp_p(wp_p3.x(), wp_p3.y());
+                const double remaining = (wp_p - robot_p).norm();
                 for (const auto& l : wp.approach_lanes())
                 {
-                  retain_mutexes.insert(
-                    graph.get_lane(l).properties().in_mutex_group());
+                  const auto& lane = graph.get_lane(l);
+                  if (next_waypoint)
+                  {
+                    const Eigen::Vector2d exit_p =
+                      graph.get_waypoint(lane.exit().waypoint_index())
+                      .get_location();
+                    if (remaining + footprint_radius < (wp_p - exit_p).norm())
+                      continue;
+                  }
+
+                  retain_mutexes.insert(lane.properties().in_mutex_group());
                 }
+
+                next_waypoint = false;
               }
 
               context->retain_mutex_groups(retain_mutexes);
