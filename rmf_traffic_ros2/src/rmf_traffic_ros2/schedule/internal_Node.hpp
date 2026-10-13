@@ -265,6 +265,9 @@ public:
   std::condition_variable conflict_check_cv;
   std::atomic_bool conflict_check_quit;
 
+  std::optional<rmf_traffic::Duration> conflict_horizon;
+  std::chrono::steady_clock::duration deferred_conflict_recheck_period;
+
   using ConflictAck = rmf_traffic_msgs::msg::NegotiationAck;
   using ConflictAckSub = rclcpp::Subscription<ConflictAck>;
   ConflictAckSub::SharedPtr conflict_ack_sub;

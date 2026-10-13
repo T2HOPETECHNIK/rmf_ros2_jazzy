@@ -36,6 +36,8 @@
 
 #include <rmf_utils/optional.hpp>
 
+#include <algorithm>
+#include <set>
 #include <unordered_map>
 #include <uuid/uuid.h>
 
@@ -75,17 +77,158 @@ std::string generate_schedule_node_name(const ScheduleNode::ScheduleId& id)
 }
 
 //==============================================================================
+struct ConflictFilter
+{
+  rmf_traffic::Time now;
+  std::optional<rmf_traffic::Duration> horizon;
+};
+
+//==============================================================================
+enum class ConflictKind
+{
+  None,
+  Imminent,
+  Deferred
+};
+
+//==============================================================================
+using ParticipantPair =
+  std::pair<rmf_traffic::ParticipantId, rmf_traffic::ParticipantId>;
+
+ParticipantPair make_pair_key(
+  rmf_traffic::ParticipantId a, rmf_traffic::ParticipantId b)
+{
+  return a < b ? ParticipantPair{a, b} : ParticipantPair{b, a};
+}
+
+//==============================================================================
+// Checks route r_a of participant a against route r_b of participant b, using
+// the same filters as upstream RMF, then the horizon filter.
+ConflictKind classify_route_pair(
+  const rmf_traffic::schedule::ParticipantDescription& desc_a,
+  const rmf_traffic::Route& route_a,
+  const rmf_traffic::ParticipantId a,
+  const rmf_traffic::PlanId plan_a,
+  const rmf_traffic::RouteId r_a,
+  const rmf_traffic::schedule::ParticipantDescription& desc_b,
+  const rmf_traffic::Route& route_b,
+  const rmf_traffic::ParticipantId b,
+  const rmf_traffic::PlanId plan_b,
+  const rmf_traffic::RouteId r_b,
+  const ConflictFilter& filter)
+{
+  if (route_a.map() != route_b.map())
+    return ConflictKind::None;
+
+  if (route_a.should_ignore(b, plan_b))
+    return ConflictKind::None;
+
+  if (route_b.should_ignore(a, plan_a))
+    return ConflictKind::None;
+
+  if (route_b.check_dependencies(a, plan_a, r_a))
+    return ConflictKind::None;
+
+  if (route_a.check_dependencies(b, plan_b, r_b))
+    return ConflictKind::None;
+
+  const auto found_conflict = rmf_traffic::DetectConflict::between(
+    desc_b.profile(), route_b.trajectory(), nullptr,
+    desc_a.profile(), route_a.trajectory(), nullptr);
+
+  if (!found_conflict.has_value())
+    return ConflictKind::None;
+
+  if (filter.horizon.has_value()
+    && found_conflict->time - filter.now > *filter.horizon)
+  {
+    return ConflictKind::Deferred;
+  }
+
+  return ConflictKind::Imminent;
+}
+
+//==============================================================================
+bool is_unresponsive(const rmf_traffic::schedule::ParticipantDescription& desc)
+{
+  return desc.responsiveness()
+    == rmf_traffic::schedule::ParticipantDescription::Rx::Unresponsive;
+}
+
+//==============================================================================
+// Re-checks conflicts that were previously beyond the horizon. Pairs that are
+// now within the horizon are returned as conflicts and pairs that no longer
+// conflict are dropped.
+std::vector<ScheduleNode::ConflictSet> recheck_deferred_conflicts(
+  std::set<ParticipantPair>& deferred,
+  const rmf_traffic::schedule::ItineraryViewer& viewer,
+  const ConflictFilter& filter)
+{
+  std::vector<ScheduleNode::ConflictSet> conflicts;
+  for (auto it = deferred.begin(); it != deferred.end(); )
+  {
+    const auto a = it->first;
+    const auto b = it->second;
+    const auto itinerary_a = viewer.get_itinerary(a);
+    const auto itinerary_b = viewer.get_itinerary(b);
+    const auto plan_a = viewer.get_current_plan_id(a);
+    const auto plan_b = viewer.get_current_plan_id(b);
+    const auto desc_a = viewer.get_participant(a);
+    const auto desc_b = viewer.get_participant(b);
+    if (!itinerary_a || !itinerary_b || !plan_a || !plan_b
+      || !desc_a || !desc_b
+      || (is_unresponsive(*desc_a) && is_unresponsive(*desc_b)))
+    {
+      it = deferred.erase(it);
+      continue;
+    }
+
+    ConflictKind result = ConflictKind::None;
+    for (std::size_t r_a = 0; r_a < itinerary_a->size(); ++r_a)
+    {
+      for (std::size_t r_b = 0; r_b < itinerary_b->size(); ++r_b)
+      {
+        const auto kind = classify_route_pair(
+          *desc_a, *(*itinerary_a)[r_a], a, *plan_a, r_a,
+          *desc_b, *(*itinerary_b)[r_b], b, *plan_b, r_b,
+          filter);
+
+        if (kind == ConflictKind::Imminent)
+        {
+          result = kind;
+          break;
+        }
+
+        if (kind == ConflictKind::Deferred)
+          result = kind;
+      }
+
+      if (result == ConflictKind::Imminent)
+        break;
+    }
+
+    if (result == ConflictKind::Deferred)
+    {
+      ++it;
+      continue;
+    }
+
+    if (result == ConflictKind::Imminent)
+      conflicts.push_back({a, b});
+
+    it = deferred.erase(it);
+  }
+
+  return conflicts;
+}
+
+//==============================================================================
 std::vector<ScheduleNode::ConflictSet> get_conflicts(
   const rmf_traffic::schedule::Viewer::View& view_changes,
-  const rmf_traffic::schedule::ItineraryViewer& viewer)
+  const rmf_traffic::schedule::ItineraryViewer& viewer,
+  const ConflictFilter& filter,
+  std::set<ParticipantPair>& deferred)
 {
-  const auto is_unresponsive = [](
-    const rmf_traffic::schedule::ParticipantDescription& desc) -> bool
-    {
-      return desc.responsiveness()
-        == rmf_traffic::schedule::ParticipantDescription::Rx::Unresponsive;
-    };
-
   std::vector<ScheduleNode::ConflictSet> conflicts;
   const auto& participants = viewer.participant_ids();
   for (const auto participant : participants)
@@ -115,34 +258,32 @@ std::vector<ScheduleNode::ConflictSet> get_conflicts(
       {
         const auto& route = itinerary[r];
         assert(route);
-        if (route->map() != vc->route->map())
-          continue;
+        const auto kind = classify_route_pair(
+          *description, *route, participant, plan_id, r,
+          vc->description, *vc->route, vc->participant, vc->plan_id,
+          vc->route_id,
+          filter);
 
-        if (route->should_ignore(vc->participant, vc->plan_id))
-          continue;
-
-        if (vc->route->should_ignore(participant, plan_id))
-          continue;
-
-        const auto* dep_v =
-          vc->route->check_dependencies(participant, plan_id, r);
-        if (dep_v)
-          continue;
-
-        const auto* dep_u =
-          route->check_dependencies(vc->participant, vc->plan_id, vc->route_id);
-        if (dep_u)
-          continue;
-
-        const auto found_conflict = rmf_traffic::DetectConflict::between(
-          vc->description.profile(), vc->route->trajectory(), nullptr,
-          description->profile(), route->trajectory(), nullptr);
-        if (found_conflict.has_value())
+        const auto key = make_pair_key(participant, vc->participant);
+        if (kind == ConflictKind::Imminent)
         {
           conflicts.push_back({participant, vc->participant});
+          deferred.erase(key);
+        }
+        else if (kind == ConflictKind::Deferred)
+        {
+          deferred.insert(key);
         }
       }
     }
+  }
+
+  // A pair can have an imminent conflict on one route and a deferred one on
+  // another. The imminent one is being negotiated, so stop tracking it here.
+  for (const auto& conflict : conflicts)
+  {
+    const auto it = conflict.begin();
+    deferred.erase(make_pair_key(*it, *std::next(it)));
   }
 
   return conflicts;
@@ -170,6 +311,29 @@ ScheduleNode::ScheduleNode(
   // Participant registry location
   declare_parameter<std::string>(
     "log_file_location", ".rmf_schedule_node.yaml");
+
+  // Conflicts that first occur more than this many seconds in the future are
+  // not negotiated until they come within range. Zero or negative disables it.
+  const double horizon_sec =
+    declare_parameter<double>("conflict_horizon_sec", 30.0);
+  if (horizon_sec > 0.0)
+  {
+    conflict_horizon = rmf_traffic::time::from_seconds(horizon_sec);
+  }
+
+  const double recheck_sec =
+    declare_parameter<double>("deferred_conflict_recheck_period_sec", 1.0);
+  deferred_conflict_recheck_period =
+    std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+    std::chrono::duration<double>(std::max(recheck_sec, 0.1)));
+
+  const std::string horizon_str = conflict_horizon.has_value() ?
+    std::to_string(horizon_sec) + "s" : "disabled";
+  RCLCPP_INFO(
+    get_logger(),
+    "Conflict filters: horizon [%s], deferred recheck period [%.2fs]",
+    horizon_str.c_str(),
+    std::max(recheck_sec, 0.1));
 
   // TODO(MXG): Expose a parameter for the update period
   // TODO(MXG): We can probably do something smarter to decide when to update
@@ -476,10 +640,25 @@ void ScheduleNode::setup_conflict_topics_and_thread()
       rmf_traffic::schedule::Mirror mirror;
       const auto query_all = rmf_traffic::schedule::query_all();
 
+      // Conflicts that were found beyond the horizon, re-checked periodically
+      std::set<ParticipantPair> deferred_conflicts;
+      auto next_deferred_recheck = std::chrono::steady_clock::now();
+
+      const auto make_filter = [&]()
+        {
+          ConflictFilter filter;
+          filter.now = rmf_traffic_ros2::convert(now());
+          filter.horizon = conflict_horizon;
+          return filter;
+        };
+
       while (rclcpp::ok(get_node_options().context()) && !conflict_check_quit)
       {
         rmf_utils::optional<rmf_traffic::schedule::Patch> next_patch;
         rmf_traffic::schedule::Viewer::View view_changes;
+        const bool recheck_due = !deferred_conflicts.empty()
+          && std::chrono::steady_clock::now() >= next_deferred_recheck;
+        bool schedule_changed = true;
 
         // Use this scope to minimize how long we lock the database for
         {
@@ -490,15 +669,22 @@ void ScheduleNode::setup_conflict_topics_and_thread()
             && !conflict_check_quit;
           });
 
-          if ( (database->latest_version() == mirror.latest_version()
-          && last_known_participants_version == current_participants_version)
-          || conflict_check_quit)
-          {
-            // This is a casual wakeup to check if we're supposed to quit yet
+          if (conflict_check_quit)
             continue;
+
+          if (database->latest_version() == mirror.latest_version()
+          && last_known_participants_version == current_participants_version)
+          {
+            // This is a casual wakeup to check if we're supposed to quit yet,
+            // or to re-check deferred conflicts against the current mirror.
+            if (!recheck_due)
+              continue;
+
+            schedule_changed = false;
           }
 
-          if (last_known_participants_version != current_participants_version)
+          if (schedule_changed
+          && last_known_participants_version != current_participants_version)
           {
             last_known_participants_version = current_participants_version;
             rmf_traffic::schedule::ParticipantDescriptionsMap participants;
@@ -518,12 +704,16 @@ void ScheduleNode::setup_conflict_topics_and_thread()
           }
 
           const auto last_checked_version = mirror.latest_version().value_or(0);
-          next_patch = database->changes(query_all, mirror.latest_version());
+          if (schedule_changed)
+          {
+            next_patch = database->changes(query_all, mirror.latest_version());
+          }
+
           // TODO(MXG): Check whether the database really needs to remain locked
           // during this update.
           try
           {
-            if (!mirror.update(*next_patch))
+            if (schedule_changed && !mirror.update(*next_patch))
             {
               const std::string mirror_version = mirror.latest_version() ?
               std::to_string(*mirror.latest_version()) : "none";
@@ -538,7 +728,8 @@ void ScheduleNode::setup_conflict_topics_and_thread()
               continue;
             }
 
-            view_changes = database->query(query_all, last_checked_version);
+            if (schedule_changed)
+              view_changes = database->query(query_all, last_checked_version);
           }
           catch (const std::exception& e)
           {
@@ -547,7 +738,19 @@ void ScheduleNode::setup_conflict_topics_and_thread()
           }
         }
 
-        auto conflicts = get_conflicts(view_changes, mirror);
+        const auto filter = make_filter();
+        auto conflicts = get_conflicts(
+          view_changes, mirror, filter, deferred_conflicts);
+
+        if (recheck_due)
+        {
+          next_deferred_recheck =
+            std::chrono::steady_clock::now() + deferred_conflict_recheck_period;
+          auto due = recheck_deferred_conflicts(
+            deferred_conflicts, mirror, filter);
+          conflicts.insert(conflicts.end(), due.begin(), due.end());
+        }
+
         for (ConflictSet& conflict : conflicts)
         {
           // Collect all other participants that have dependencies on the ones
