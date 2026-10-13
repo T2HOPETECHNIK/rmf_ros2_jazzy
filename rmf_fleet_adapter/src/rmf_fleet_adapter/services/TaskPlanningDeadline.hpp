@@ -35,7 +35,14 @@ public:
   TaskPlanningDeadline(
     Clock::duration budget,
     std::function<bool()> interrupter = nullptr)
-  : _deadline(Clock::now() + budget),
+  : TaskPlanningDeadline(Clock::now() + budget, std::move(interrupter))
+  {
+  }
+
+  TaskPlanningDeadline(
+    Clock::time_point deadline,
+    std::function<bool()> interrupter = nullptr)
+  : _deadline(deadline),
     _interrupter(std::move(interrupter))
   {
   }
