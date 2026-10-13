@@ -81,7 +81,26 @@ struct ConflictFilter
 {
   rmf_traffic::Time now;
   std::optional<rmf_traffic::Duration> horizon;
+  std::size_t min_free_waypoints;
 };
+
+//==============================================================================
+// Number of waypoints a participant still has to pass before reaching the
+// conflict. A route that has not started yet counts from its first waypoint.
+// Zero when it is already at or past the conflict waypoint.
+std::size_t waypoints_until(
+  const rmf_traffic::Trajectory& trajectory,
+  const rmf_traffic::Trajectory::const_iterator& conflict_it,
+  const rmf_traffic::Time now)
+{
+  const auto current = trajectory.lower_bound(now);
+  if (current == trajectory.end())
+    return 0;
+
+  const std::size_t current_index = current->index();
+  const std::size_t conflict_index = conflict_it->index();
+  return conflict_index > current_index ? conflict_index - current_index : 0;
+}
 
 //==============================================================================
 enum class ConflictKind
@@ -139,10 +158,25 @@ ConflictKind classify_route_pair(
   if (!found_conflict.has_value())
     return ConflictKind::None;
 
-  if (filter.horizon.has_value()
-    && found_conflict->time - filter.now > *filter.horizon)
+  if (filter.horizon.has_value())
   {
-    return ConflictKind::Deferred;
+    const rmf_traffic::Duration time_until_conflict =
+      found_conflict->time - filter.now;
+
+    if (time_until_conflict > *filter.horizon)
+    {
+      // DetectConflict was given route_b first, so a_it belongs to route_b.
+      const auto free_b = waypoints_until(
+        route_b.trajectory(), found_conflict->a_it, filter.now);
+      const auto free_a = waypoints_until(
+        route_a.trajectory(), found_conflict->b_it, filter.now);
+
+      if (free_a > filter.min_free_waypoints
+        && free_b > filter.min_free_waypoints)
+      {
+        return ConflictKind::Deferred;
+      }
+    }
   }
 
   return ConflictKind::Imminent;
@@ -327,13 +361,22 @@ ScheduleNode::ScheduleNode(
     std::chrono::duration_cast<std::chrono::steady_clock::duration>(
     std::chrono::duration<double>(std::max(recheck_sec, 0.1)));
 
+  // Conflicts closer than this many waypoints for either participant are
+  // negotiated immediately regardless of the horizon.
+  const int min_free_waypoints_param =
+    declare_parameter<int>("deferred_conflict_min_free_waypoints", 2);
+  deferred_conflict_min_free_waypoints =
+    static_cast<std::size_t>(std::max(min_free_waypoints_param, 0));
+
   const std::string horizon_str = conflict_horizon.has_value() ?
     std::to_string(horizon_sec) + "s" : "disabled";
   RCLCPP_INFO(
     get_logger(),
-    "Conflict filters: horizon [%s], deferred recheck period [%.2fs]",
+    "Conflict filters: horizon [%s], deferred recheck period [%.2fs], "
+    "min free waypoints [%zu]",
     horizon_str.c_str(),
-    std::max(recheck_sec, 0.1));
+    std::max(recheck_sec, 0.1),
+    deferred_conflict_min_free_waypoints);
 
   // TODO(MXG): Expose a parameter for the update period
   // TODO(MXG): We can probably do something smarter to decide when to update
@@ -649,6 +692,7 @@ void ScheduleNode::setup_conflict_topics_and_thread()
           ConflictFilter filter;
           filter.now = rmf_traffic_ros2::convert(now());
           filter.horizon = conflict_horizon;
+          filter.min_free_waypoints = deferred_conflict_min_free_waypoints;
           return filter;
         };
 
