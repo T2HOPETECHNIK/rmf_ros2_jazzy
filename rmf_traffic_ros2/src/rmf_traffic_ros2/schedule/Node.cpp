@@ -1,18 +1,18 @@
 /*
- * Copyright (C) 2019 Open Source Robotics Foundation
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- *
+* Copyright (C) 2019 Open Source Robotics Foundation
+*
+* Licensed under the Apache License, Version 2.0 (the "License");
+* you may not use this file except in compliance with the License.
+* You may obtain a copy of the License at
+*
+*     http://www.apache.org/licenses/LICENSE-2.0
+*
+* Unless required by applicable law or agreed to in writing, software
+* distributed under the License is distributed on an "AS IS" BASIS,
+* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+* See the License for the specific language governing permissions and
+* limitations under the License.
+*
 */
 
 #include "internal_Node.hpp"
@@ -742,22 +742,23 @@ void ScheduleNode::setup_conflict_topics_and_thread()
         auto conflicts = get_conflicts(
           view_changes, mirror, filter, deferred_conflicts);
 
-        // Pairs promoted from deferred_conflicts by the recheck below, in the
-        // same order as their entries in conflicts starting at first_promoted.
-        std::vector<ParticipantPair> promoted;
-        std::size_t first_promoted = conflicts.size();
         if (recheck_due)
         {
           next_deferred_recheck =
             std::chrono::steady_clock::now() + deferred_conflict_recheck_period;
           auto due = recheck_deferred_conflicts(
             deferred_conflicts, mirror, filter);
-          for (const auto& c : due)
-          {
-            promoted.push_back(
-              make_pair_key(*c.begin(), *std::next(c.begin())));
-          }
           conflicts.insert(conflicts.end(), due.begin(), due.end());
+        }
+
+        // The conflicting pair of each entry in conflicts, captured before
+        // dependency expansion adds other participants to the sets.
+        std::vector<ParticipantPair> conflict_pairs;
+        conflict_pairs.reserve(conflicts.size());
+        for (const auto& c : conflicts)
+        {
+          conflict_pairs.push_back(
+            make_pair_key(*c.begin(), *std::next(c.begin())));
         }
 
         for (ConflictSet& conflict : conflicts)
@@ -810,13 +811,13 @@ void ScheduleNode::setup_conflict_topics_and_thread()
           {
             new_negotiations[new_negotiation->first] = new_negotiation->second;
           }
-          else if (i >= first_promoted)
+          else
           {
             // The negotiation could not be opened yet, e.g. a participant is
             // still waiting to acknowledge a previous negotiation. Nothing may
             // change its itinerary to rediscover this pair, so keep deferring
             // it and let the next recheck try again.
-            deferred_conflicts.insert(promoted[i - first_promoted]);
+            deferred_conflicts.insert(conflict_pairs[i]);
           }
         }
 
