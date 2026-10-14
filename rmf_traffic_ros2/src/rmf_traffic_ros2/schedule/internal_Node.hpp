@@ -26,6 +26,8 @@
 
 #include <rclcpp/node.hpp>
 
+#include <rmf_building_map_msgs/msg/building_map.hpp>
+
 #include <rmf_traffic_msgs/msg/mirror_update.hpp>
 #include <rmf_traffic_msgs/msg/participant.hpp>
 #include <rmf_traffic_msgs/msg/participants.hpp>
@@ -64,8 +66,10 @@
 
 #include <rmf_utils/Modular.hpp>
 
+#include <mutex>
 #include <optional>
 #include <set>
+#include <string>
 #include <unordered_map>
 #include <utility>
 
@@ -73,6 +77,18 @@ namespace rmf_traffic_ros2 {
 namespace schedule {
 
 using namespace std::chrono_literals;
+
+//==============================================================================
+/// Footprint of a lift cabin on one map, in that map's coordinates.
+struct LiftCabin
+{
+  std::string map;
+  double x;
+  double y;
+  double yaw;
+  double half_width;
+  double half_depth;
+};
 
 //==============================================================================
 class ScheduleNode : public rclcpp::Node
@@ -269,6 +285,15 @@ public:
   std::optional<rmf_traffic::Duration> conflict_horizon;
   std::chrono::steady_clock::duration deferred_conflict_recheck_period;
   std::size_t deferred_conflict_min_free_waypoints;
+
+  // Conflicts of a participant that is riding a lift are deferred until the
+  // ride is over, since it cannot act on them from inside the cabin.
+  bool defer_lift_ride_conflicts = true;
+  double lift_cabin_margin = 0.0;
+  std::mutex lift_cabins_mutex;
+  std::vector<LiftCabin> lift_cabins;
+  using BuildingMap = rmf_building_map_msgs::msg::BuildingMap;
+  rclcpp::Subscription<BuildingMap>::SharedPtr building_map_sub;
   
   using ConflictAck = rmf_traffic_msgs::msg::NegotiationAck;
   using ConflictAckSub = rclcpp::Subscription<ConflictAck>;
