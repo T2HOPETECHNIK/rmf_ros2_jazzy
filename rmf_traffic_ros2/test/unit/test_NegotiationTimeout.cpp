@@ -101,6 +101,22 @@ TEST_CASE("Schedule culling expires only elapsed negotiation deadlines",
     {
       open->last_active_time = now + 5s;
     }
+    SECTION("Exceeding the maximum duration ends a negotiation despite activity")
+    {
+      node->max_negotiation_duration = 60s;
+      open->last_active_time = now - 161ms;
+      expires = true;
+    }
+    SECTION("A negotiation under the maximum duration stays open")
+    {
+      node->max_negotiation_duration = 61s;
+      open->last_active_time = now - 161ms;
+    }
+    SECTION("A disabled maximum duration keeps an active negotiation open")
+    {
+      node->max_negotiation_duration = std::nullopt;
+      open->last_active_time = now - 161ms;
+    }
 
     node->cull();
     CHECK((conflicts.negotiation(version) == nullptr) == expires);

@@ -368,6 +368,17 @@ ScheduleNode::ScheduleNode(
   deferred_conflict_min_free_waypoints =
     static_cast<std::size_t>(std::max(min_free_waypoints_param, 0));
 
+  // Negotiations still receiving responses are ended once they have run this
+  // many seconds, so participants that never converge can replan. Zero or
+  // negative disables the cap.
+  const double max_negotiation_sec =
+    declare_parameter<double>("max_negotiation_duration_sec", 120.0);
+  if (max_negotiation_sec > 0.0)
+  {
+    max_negotiation_duration =
+      rmf_traffic::time::from_seconds(max_negotiation_sec);
+  }
+
   const std::string horizon_str = conflict_horizon.has_value() ?
     std::to_string(horizon_sec) + "s" : "disabled";
   RCLCPP_INFO(
@@ -783,8 +794,14 @@ void ScheduleNode::setup_conflict_topics_and_thread()
         }
 
         const auto filter = make_filter();
-        auto conflicts = get_conflicts(
-          view_changes, mirror, filter, deferred_conflicts);
+        // view_changes is only populated when the schedule changed. On a
+        // recheck-only wakeup it is default-constructed and must not be read.
+        std::vector<ConflictSet> conflicts;
+        if (schedule_changed)
+        {
+          conflicts = get_conflicts(
+            view_changes, mirror, filter, deferred_conflicts);
+        }
 
         if (recheck_due)
         {
@@ -798,8 +815,16 @@ void ScheduleNode::setup_conflict_topics_and_thread()
         const auto new_negotiations = insert_conflicts(
           std::move(conflicts), mirror, deferred_conflicts);
 
+        // The negotiation pointers and active_conflicts are also modified by
+        // the negotiation callbacks, so hold the lock while reading them.
+        std::unique_lock<std::mutex> lock(active_conflicts_mutex);
         for (const auto& n : new_negotiations)
         {
+          // The negotiation may have concluded after insert_conflicts released
+          // the lock, which would leave n.second dangling.
+          if (!active_conflicts.negotiation(n.first))
+            continue;
+
           std::cout << "Require negotiation for:";
           for (const auto p : n.second->participants())
             std::cout << " " << p;
@@ -1158,6 +1183,19 @@ void ScheduleNode::cull()
         // TODO(MXG): Make this deadline configurable
         if (open->last_active_time + std::chrono::seconds(30) <= time)
         {
+          cull_negotiation.push_back(v);
+        }
+        // A negotiation with many participants can keep receiving messages
+        // without ever converging, which keeps last_active_time fresh. Cap its
+        // total duration so the participants can replan.
+        else if (max_negotiation_duration.has_value() &&
+          open->start_time + *max_negotiation_duration <= time)
+        {
+          RCLCPP_WARN(
+            get_logger(),
+            "Negotiation %lu is still receiving responses but has exceeded the "
+            "maximum duration of %.1fs", v,
+            rmf_traffic::time::to_seconds(*max_negotiation_duration));
           cull_negotiation.push_back(v);
         }
       }

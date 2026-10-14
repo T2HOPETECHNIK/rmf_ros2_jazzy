@@ -269,6 +269,7 @@ public:
   std::optional<rmf_traffic::Duration> conflict_horizon;
   std::chrono::steady_clock::duration deferred_conflict_recheck_period;
   std::size_t deferred_conflict_min_free_waypoints;
+  std::optional<rmf_traffic::Duration> max_negotiation_duration;
   
   using ConflictAck = rmf_traffic_msgs::msg::NegotiationAck;
   using ConflictAckSub = rclcpp::Subscription<ConflictAck>;
