@@ -21,6 +21,7 @@
 #include "NegotiationRoom.hpp"
 
 #include <rmf_traffic/schedule/Database.hpp>
+#include <rmf_traffic/schedule/Mirror.hpp>
 #include <rmf_traffic/schedule/Negotiation.hpp>
 
 #include <rclcpp/node.hpp>
@@ -540,6 +541,13 @@ public:
   ConflictRecord active_conflicts;
   std::mutex active_conflicts_mutex;
   std::shared_ptr<ParticipantRegistry> participant_registry;
+
+  // Insert detected pairs after dependency expansion. Pairs blocked by a
+  // negotiation wait are retained for periodic rechecking without an update.
+  std::unordered_map<Version, const Negotiation*> insert_conflicts(
+    std::vector<ConflictSet> conflicts,
+    const rmf_traffic::schedule::Mirror& mirror,
+    std::set<std::pair<ParticipantId, ParticipantId>>& deferred);
 
   virtual void setup_conflict_topics_and_thread();
   void setup_cull_timer();

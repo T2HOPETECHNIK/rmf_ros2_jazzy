@@ -111,3 +111,93 @@ TEST_CASE("Schedule culling expires only elapsed negotiation deadlines",
   node.reset();
   context->shutdown("test complete");
 }
+
+TEST_CASE("Conflicts blocked by negotiation waits remain retryable",
+  "[deferred_conflict]")
+{
+  const bool expire_wait = GENERATE(false, true);
+  // Also cover a waiting participant added through dependency expansion.
+  const int waiting_index = GENERATE(0, 1, 2);
+  auto context = std::make_shared<rclcpp::Context>();
+  context->init(0, nullptr);
+  auto database = std::make_shared<rmf_traffic::schedule::Database>();
+  auto node = std::make_shared<ScheduleNode>(
+    database, rclcpp::NodeOptions().context(context),
+    ScheduleNode::NoAutomaticSetup{});
+  const auto now = rmf_traffic_ros2::convert(node->now());
+  using Description = rmf_traffic::schedule::ParticipantDescription;
+  const auto shape = rmf_traffic::geometry::make_final_convex<
+    rmf_traffic::geometry::Circle>(0.5);
+  std::vector<rmf_traffic::ParticipantId> ids;
+  rmf_traffic::schedule::ParticipantDescriptionsMap descriptions;
+  for (const auto& name : {"a", "b", "dependent"})
+  {
+    Description description(name, "test", Description::Rx::Responsive,
+      rmf_traffic::Profile{shape});
+    const auto id = database->register_participant(description).id();
+    ids.push_back(id);
+    descriptions.emplace(id, description);
+    rmf_traffic::Trajectory trajectory;
+    trajectory.insert(now, Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero());
+    trajectory.insert(now + 60s,
+      Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero());
+    rmf_traffic::Route route("test_map", std::move(trajectory));
+    if (ids.size() == 3)
+      route.add_dependency(0, {ids[0], 0, 0, 1});
+    database->set(id, 0, {route}, 0, 1);
+  }
+
+  rmf_traffic::schedule::Mirror mirror;
+  mirror.update_participants_info(descriptions);
+  REQUIRE(mirror.update(database->changes(
+      rmf_traffic::schedule::query_all(), std::nullopt)));
+  const auto version = mirror.latest_version();
+  const auto waiting = ids[waiting_index];
+  auto& record = node->active_conflicts;
+  record._waiting.emplace(waiting, ScheduleNode::ConflictRecord::Wait{
+      86, std::nullopt, now - 31s});
+  const auto pair = std::make_pair(ids[0], ids[1]);
+  std::set<std::pair<rmf_traffic::ParticipantId, rmf_traffic::ParticipantId>>
+    deferred;
+
+  // Both changed-route detection and horizon promotion hand off an imminent
+  // pair after removing it from the deferred set. Failed insertion must put
+  // the original pair back, even when the blocker is a dependent participant.
+  CHECK(node->insert_conflicts({{ids[0], ids[1]}}, mirror, deferred).empty());
+  REQUIRE(deferred.size() == 1);
+  CHECK(deferred.count(pair) == 1);
+  CHECK(record._negotiations.empty());
+  CHECK(node->insert_conflicts({{ids[0], ids[1]}}, mirror, deferred).empty());
+  CHECK(deferred.size() == 1);
+
+  if (expire_wait)
+  {
+    node->cull();
+  }
+  else
+  {
+    ScheduleNode::ConflictAck ack;
+    ack.conflict_version = 86;
+    ack.acknowledgments.emplace_back();
+    ack.acknowledgments.back().participant = waiting;
+    ack.acknowledgments.back().updating = false;
+    node->receive_conclusion_ack(ack);
+  }
+  REQUIRE(record._waiting.empty());
+  CHECK(mirror.latest_version() == version);
+
+  // The periodic retry uses the same mirror: no itinerary update is needed.
+  const auto entry = node->insert_conflicts(
+    {{deferred.begin()->first, deferred.begin()->second}}, mirror, deferred);
+  REQUIRE(entry.size() == 1);
+  CHECK(deferred.empty());
+  CHECK(entry.begin()->second->participants().size() == 3);
+
+  // Nullopt for an already active negotiation is not a blocked insertion.
+  deferred.insert(pair);
+  CHECK(node->insert_conflicts({{ids[0], ids[1]}}, mirror, deferred).empty());
+  CHECK(deferred.empty());
+  CHECK(record._negotiations.size() == 1);
+  node.reset();
+  context->shutdown("test complete");
+}

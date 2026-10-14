@@ -795,75 +795,8 @@ void ScheduleNode::setup_conflict_topics_and_thread()
           conflicts.insert(conflicts.end(), due.begin(), due.end());
         }
 
-        // The conflicting pair of each entry in conflicts, captured before
-        // dependency expansion adds other participants to the sets.
-        std::vector<ParticipantPair> conflict_pairs;
-        conflict_pairs.reserve(conflicts.size());
-        for (const auto& c : conflicts)
-        {
-          conflict_pairs.push_back(
-            make_pair_key(*c.begin(), *std::next(c.begin())));
-        }
-
-        for (ConflictSet& conflict : conflicts)
-        {
-          // Collect all other participants that have dependencies on the ones
-          // conflicting before we open the negotiation.
-          std::vector<rmf_traffic::ParticipantId> queue;
-          for (const auto p : conflict)
-            queue.push_back(p);
-
-          while (!queue.empty())
-          {
-            const auto check = queue.back();
-            queue.pop_back();
-
-            for (const auto& p : mirror.participant_ids())
-            {
-              if (conflict.count(p) > 0)
-                continue;
-
-              const auto& itinerary = mirror.get_itinerary(p);
-              if (!itinerary.has_value())
-                continue;
-
-              for (const auto& r : *itinerary)
-              {
-                const auto d_it = r->dependencies().find(check);
-                const bool include = d_it != r->dependencies().end()
-                && d_it->second.plan().has_value();
-
-                if (include)
-                {
-                  queue.push_back(p);
-                  conflict.insert(p);
-                  break;
-                }
-              }
-            }
-          }
-        }
-
-        std::unordered_map<Version, const Negotiation*> new_negotiations;
-        for (std::size_t i = 0; i < conflicts.size(); ++i)
-        {
-          std::unique_lock<std::mutex> lock(active_conflicts_mutex);
-          const auto new_negotiation = active_conflicts.insert(
-            conflicts[i], rmf_traffic_ros2::convert(now()), mirror);
-
-          if (new_negotiation)
-          {
-            new_negotiations[new_negotiation->first] = new_negotiation->second;
-          }
-          else
-          {
-            // The negotiation could not be opened yet, e.g. a participant is
-            // still waiting to acknowledge a previous negotiation. Nothing may
-            // change its itinerary to rediscover this pair, so keep deferring
-            // it and let the next recheck try again.
-            deferred_conflicts.insert(conflict_pairs[i]);
-          }
-        }
+        const auto new_negotiations = insert_conflicts(
+          std::move(conflicts), mirror, deferred_conflicts);
 
         for (const auto& n : new_negotiations)
         {
@@ -884,6 +817,87 @@ void ScheduleNode::setup_conflict_topics_and_thread()
         }
       }
     });
+}
+
+//==============================================================================
+std::unordered_map<ScheduleNode::Version, const ScheduleNode::Negotiation*>
+ScheduleNode::insert_conflicts(
+  std::vector<ConflictSet> conflicts,
+  const rmf_traffic::schedule::Mirror& mirror,
+  std::set<std::pair<ParticipantId, ParticipantId>>& deferred)
+{
+  std::unordered_map<Version, const Negotiation*> new_negotiations;
+  for (auto& conflict : conflicts)
+  {
+    // Conflict detection produces pairs. Preserve that pair before adding
+    // dependencies, so a retry revalidates the actual geometric conflict.
+    assert(conflict.size() == 2);
+    const auto first = conflict.begin();
+    const auto pair = make_pair_key(*first, *std::next(first));
+
+    // Collect all other participants that have dependencies on the ones
+    // conflicting before we open the negotiation.
+    std::vector<rmf_traffic::ParticipantId> queue;
+    for (const auto p : conflict)
+      queue.push_back(p);
+
+    while (!queue.empty())
+    {
+      const auto check = queue.back();
+      queue.pop_back();
+
+      for (const auto& p : mirror.participant_ids())
+      {
+        if (conflict.count(p) > 0)
+          continue;
+
+        const auto& itinerary = mirror.get_itinerary(p);
+        if (!itinerary.has_value())
+          continue;
+
+        for (const auto& r : *itinerary)
+        {
+          const auto d_it = r->dependencies().find(check);
+          const bool include = d_it != r->dependencies().end()
+          && d_it->second.plan().has_value();
+
+          if (include)
+          {
+            queue.push_back(p);
+            conflict.insert(p);
+            break;
+          }
+        }
+      }
+    }
+
+    std::unique_lock<std::mutex> lock(active_conflicts_mutex);
+    const bool waiting = std::any_of(
+      conflict.begin(), conflict.end(), [&](const auto p)
+      {
+        return active_conflicts._waiting.count(p) > 0;
+      });
+    if (waiting)
+    {
+      // Both detection paths remove imminent pairs before insertion. Restore
+      // them if a participant (including a dependency) is awaiting an update.
+      // An acknowledgment without an update, or wait culling, does not change
+      // the itinerary and therefore cannot rediscover this conflict for us.
+      deferred.insert(pair);
+      continue;
+    }
+
+    const auto entry = active_conflicts.insert(
+      conflict, rmf_traffic_ros2::convert(now()), mirror);
+    if (entry)
+      new_negotiations[entry->first] = entry->second;
+
+    // With waiting excluded under the same lock, nullopt means there were no
+    // participants to add to the active negotiations, rather than a wait.
+    deferred.erase(pair);
+  }
+
+  return new_negotiations;
 }
 
 //==============================================================================
