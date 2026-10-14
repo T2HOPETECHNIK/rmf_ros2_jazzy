@@ -201,3 +201,114 @@ TEST_CASE("Conflicts blocked by negotiation waits remain retryable",
   node.reset();
   context->shutdown("test complete");
 }
+
+TEST_CASE("Pairs split across active negotiations remain retryable",
+  "[deferred_conflict][split_negotiation]")
+{
+  const bool add_dependent = GENERATE(false, true);
+  // Release the second negotiation by refusal, culling, or acknowledgment.
+  const int release_mode = GENERATE(0, 1, 2);
+  auto context = std::make_shared<rclcpp::Context>();
+  context->init(0, nullptr);
+  auto database = std::make_shared<rmf_traffic::schedule::Database>();
+  auto node = std::make_shared<ScheduleNode>(
+    database, rclcpp::NodeOptions().context(context),
+    ScheduleNode::NoAutomaticSetup{});
+  node->conflict_conclusion_pub =
+    node->create_publisher<ScheduleNode::ConflictConclusion>("test_conclusion", 10);
+  node->negotiation_states_pub =
+    node->create_publisher<ScheduleNode::NegotiationStates>("test_states", 10);
+  node->negotiation_stasuses_pub =
+    node->create_publisher<ScheduleNode::NegotiationStatuses>("test_status", 10);
+  const auto now = rmf_traffic_ros2::convert(node->now());
+  using Description = rmf_traffic::schedule::ParticipantDescription;
+  const auto shape = rmf_traffic::geometry::make_final_convex<
+    rmf_traffic::geometry::Circle>(0.5);
+  std::vector<rmf_traffic::ParticipantId> ids;
+  rmf_traffic::schedule::ParticipantDescriptionsMap descriptions;
+  for (const auto& name : {"a", "b", "x", "y", "dependent"})
+  {
+    Description description(name, "test", Description::Rx::Responsive,
+      rmf_traffic::Profile{shape});
+    const auto id = database->register_participant(description).id();
+    ids.push_back(id);
+    descriptions.emplace(id, description);
+    rmf_traffic::Trajectory trajectory;
+    trajectory.insert(now, Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero());
+    trajectory.insert(now + 60s,
+      Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero());
+    rmf_traffic::Route route("test_map", std::move(trajectory));
+    if (add_dependent && ids.size() == 5)
+      route.add_dependency(0, {ids[0], 0, 0, 1});
+    database->set(id, 0, {route}, 0, 1);
+  }
+
+  rmf_traffic::schedule::Mirror mirror;
+  mirror.update_participants_info(descriptions);
+  REQUIRE(mirror.update(database->changes(
+      rmf_traffic::schedule::query_all(), std::nullopt)));
+  const auto mirror_version = mirror.latest_version();
+  auto& record = node->active_conflicts;
+  const auto first = record.insert({ids[0], ids[2]}, now, mirror);
+  const auto second = record.insert({ids[1], ids[3]}, now, mirror);
+  REQUIRE(first.has_value());
+  REQUIRE(second.has_value());
+  REQUIRE(first->first != second->first);
+  const auto pair = std::make_pair(ids[0], ids[1]);
+  std::set<std::pair<rmf_traffic::ParticipantId, rmf_traffic::ParticipantId>>
+    deferred;
+
+  // No entry is returned for two assigned participants. Adding a dependent
+  // can return an entry, but still does not place A and B in the same room.
+  const auto inserted = node->insert_conflicts(
+    {{ids[0], ids[1]}}, mirror, deferred);
+  CHECK(inserted.size() == (add_dependent ? 1u : 0u));
+  CHECK(record._version.at(ids[0]) != record._version.at(ids[1]));
+  REQUIRE(deferred.count(pair) == 1);
+  CHECK(node->insert_conflicts({{ids[0], ids[1]}}, mirror, deferred).empty());
+  CHECK(deferred.size() == 1);
+  CHECK(record._negotiations.size() == 2);
+
+  if (release_mode == 0)
+  {
+    node->refuse(second->first);
+  }
+  else if (release_mode == 1)
+  {
+    record.negotiation(second->first)->last_active_time = now - 31s;
+    node->cull();
+  }
+  else
+  {
+    const auto participants =
+      record.negotiation(second->first)->room.negotiation.participants();
+    record.conclude(second->first, now);
+    // Conclusion introduces a wait, so periodic retry must still retain A-B.
+    CHECK(node->insert_conflicts({{ids[0], ids[1]}}, mirror, deferred).empty());
+    CHECK(deferred.count(pair) == 1);
+    ScheduleNode::ConflictAck ack;
+    ack.conflict_version = second->first;
+    for (const auto participant : participants)
+    {
+      ack.acknowledgments.emplace_back();
+      ack.acknowledgments.back().participant = participant;
+      ack.acknowledgments.back().updating = false;
+    }
+    node->receive_conclusion_ack(ack);
+  }
+
+  REQUIRE(record._waiting.empty());
+  REQUIRE(record._version.count(ids[1]) == 0);
+  // Reuse the unchanged mirror and the retained pair for periodic retry.
+  CHECK(mirror.latest_version() == mirror_version);
+  const auto retry = node->insert_conflicts(
+    {{deferred.begin()->first, deferred.begin()->second}}, mirror, deferred);
+  REQUIRE(retry.size() == 1);
+  CHECK(record._version.at(ids[0]) == record._version.at(ids[1]));
+  CHECK(deferred.empty());
+  CHECK(record._negotiations.size() == 1);
+  CHECK(node->insert_conflicts({{ids[0], ids[1]}}, mirror, deferred).empty());
+  CHECK(deferred.empty());
+  node.reset();
+  context->shutdown("test complete");
+}

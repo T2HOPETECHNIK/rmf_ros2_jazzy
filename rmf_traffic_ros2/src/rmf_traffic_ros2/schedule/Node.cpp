@@ -892,9 +892,21 @@ ScheduleNode::insert_conflicts(
     if (entry)
       new_negotiations[entry->first] = entry->second;
 
-    // With waiting excluded under the same lock, nullopt means there were no
-    // participants to add to the active negotiations, rather than a wait.
-    deferred.erase(pair);
+    // Insertion can leave the pair in separate negotiations, even when it
+    // succeeds by adding a dependent participant. Only stop retrying once
+    // both members of the original pair belong to the same negotiation.
+    const auto a = active_conflicts._version.find(pair.first);
+    const auto b = active_conflicts._version.find(pair.second);
+    if (a != active_conflicts._version.end()
+      && b != active_conflicts._version.end()
+      && a->second == b->second)
+    {
+      deferred.erase(pair);
+    }
+    else
+    {
+      deferred.insert(pair);
+    }
   }
 
   return new_negotiations;
