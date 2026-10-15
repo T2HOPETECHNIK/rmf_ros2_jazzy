@@ -32,11 +32,13 @@
 #include <rmf_traffic_ros2/schedule/ScheduleIdentity.hpp>
 
 #include <rmf_traffic/DetectConflict.hpp>
+#include <rmf_traffic/Motion.hpp>
 #include <rmf_traffic/schedule/Mirror.hpp>
 
 #include <rmf_utils/optional.hpp>
 
 #include <algorithm>
+#include <cmath>
 #include <set>
 #include <unordered_map>
 #include <uuid/uuid.h>
@@ -82,7 +84,72 @@ struct ConflictFilter
   rmf_traffic::Time now;
   std::optional<rmf_traffic::Duration> horizon;
   std::size_t min_free_waypoints;
+  std::vector<LiftCabin> cabins;
+  double cabin_margin = 0.0;
 };
+
+//==============================================================================
+bool inside_cabin(
+  const LiftCabin& cabin, const Eigen::Vector3d& p, const double margin)
+{
+  const double dx = p.x() - cabin.x;
+  const double dy = p.y() - cabin.y;
+  const double c = std::cos(cabin.yaw);
+  const double s = std::sin(cabin.yaw);
+  const double local_x = c*dx + s*dy;
+  const double local_y = -s*dx + c*dy;
+  return std::abs(local_x) <= cabin.half_width + margin
+    && std::abs(local_y) <= cabin.half_depth + margin;
+}
+
+//==============================================================================
+// True if the participant is currently riding a lift. The planner puts the
+// trajectory of a floor-changing lane on both maps, so during a ride the
+// itinerary has routes on two different maps that both cover the current time.
+// The position must also be inside a lift cabin on one of those maps.
+bool riding_lift(
+  const rmf_traffic::schedule::ItineraryView& itinerary,
+  const ConflictFilter& filter)
+{
+  if (filter.cabins.empty())
+    return false;
+
+  std::set<std::string> maps_now;
+  bool in_cabin = false;
+  for (const auto& route : itinerary)
+  {
+    if (!route)
+      continue;
+
+    const auto& trajectory = route->trajectory();
+    const auto* start = trajectory.start_time();
+    const auto* finish = trajectory.finish_time();
+    if (!start || !finish || trajectory.size() < 2
+      || filter.now < *start || *finish < filter.now)
+      continue;
+
+    maps_now.insert(route->map());
+
+    if (in_cabin)
+      continue;
+
+    const Eigen::Vector3d p =
+      rmf_traffic::Motion::compute_cubic_splines(trajectory)
+      ->compute_position(filter.now);
+
+    for (const auto& cabin : filter.cabins)
+    {
+      if (cabin.map == route->map()
+        && inside_cabin(cabin, p, filter.cabin_margin))
+      {
+        in_cabin = true;
+        break;
+      }
+    }
+  }
+
+  return in_cabin && maps_now.size() > 1;
+}
 
 //==============================================================================
 // Number of waypoints a participant still has to pass before reaching the
@@ -122,14 +189,16 @@ ParticipantPair make_pair_key(
 
 //==============================================================================
 // Checks route r_a of participant a against route r_b of participant b, using
-// the same filters as upstream RMF, then the horizon filter.
+// the same filters as upstream RMF, then the lift ride and horizon filters.
 ConflictKind classify_route_pair(
   const rmf_traffic::schedule::ParticipantDescription& desc_a,
+  const rmf_traffic::schedule::ItineraryView& itinerary_a,
   const rmf_traffic::Route& route_a,
   const rmf_traffic::ParticipantId a,
   const rmf_traffic::PlanId plan_a,
   const rmf_traffic::RouteId r_a,
   const rmf_traffic::schedule::ParticipantDescription& desc_b,
+  const rmf_traffic::schedule::ItineraryView& itinerary_b,
   const rmf_traffic::Route& route_b,
   const rmf_traffic::ParticipantId b,
   const rmf_traffic::PlanId plan_b,
@@ -157,6 +226,12 @@ ConflictKind classify_route_pair(
 
   if (!found_conflict.has_value())
     return ConflictKind::None;
+
+  // A participant riding a lift cannot do anything about a conflict until it
+  // leaves the cabin, so negotiating now would only end in a forfeit. Defer
+  // the conflict and negotiate it once the ride is over.
+  if (riding_lift(itinerary_a, filter) || riding_lift(itinerary_b, filter))
+    return ConflictKind::Deferred;
 
   if (filter.horizon.has_value())
   {
@@ -223,8 +298,8 @@ std::vector<ScheduleNode::ConflictSet> recheck_deferred_conflicts(
       for (std::size_t r_b = 0; r_b < itinerary_b->size(); ++r_b)
       {
         const auto kind = classify_route_pair(
-          *desc_a, *(*itinerary_a)[r_a], a, *plan_a, r_a,
-          *desc_b, *(*itinerary_b)[r_b], b, *plan_b, r_b,
+          *desc_a, *itinerary_a, *(*itinerary_a)[r_a], a, *plan_a, r_a,
+          *desc_b, *itinerary_b, *(*itinerary_b)[r_b], b, *plan_b, r_b,
           filter);
 
         if (kind == ConflictKind::Imminent)
@@ -288,14 +363,18 @@ std::vector<ScheduleNode::ConflictSet> get_conflicts(
         continue;
       }
 
+      const auto other_itinerary =
+        viewer.get_itinerary(vc->participant)
+        .value_or(rmf_traffic::schedule::ItineraryView{});
+
       for (std::size_t r = 0; r < itinerary.size(); ++r)
       {
         const auto& route = itinerary[r];
         assert(route);
         const auto kind = classify_route_pair(
-          *description, *route, participant, plan_id, r,
-          vc->description, *vc->route, vc->participant, vc->plan_id,
-          vc->route_id,
+          *description, itinerary, *route, participant, plan_id, r,
+          vc->description, other_itinerary, *vc->route, vc->participant,
+          vc->plan_id, vc->route_id,
           filter);
 
         const auto key = make_pair_key(participant, vc->participant);
@@ -368,6 +447,11 @@ ScheduleNode::ScheduleNode(
   deferred_conflict_min_free_waypoints =
     static_cast<std::size_t>(std::max(min_free_waypoints_param, 0));
 
+  // Defer conflicts of participants that are riding a lift
+  defer_lift_ride_conflicts =
+    declare_parameter<bool>("defer_lift_ride_conflicts", true);
+  lift_cabin_margin = declare_parameter<double>("lift_cabin_margin", 0.1);
+  
   // Negotiations still receiving responses are ended once they have run this
   // many seconds, so participants that never converge can replan. Zero or
   // negative disables the cap.
@@ -384,10 +468,13 @@ ScheduleNode::ScheduleNode(
   RCLCPP_INFO(
     get_logger(),
     "Conflict filters: horizon [%s], deferred recheck period [%.2fs], "
-    "min free waypoints [%zu]",
+    "min free waypoints [%zu], defer lift ride conflicts [%s] "
+    "(margin %.2fm)",
     horizon_str.c_str(),
     std::max(recheck_sec, 0.1),
-    deferred_conflict_min_free_waypoints);
+    deferred_conflict_min_free_waypoints,
+    defer_lift_ride_conflicts ? "true" : "false",
+    lift_cabin_margin);
 
   // TODO(MXG): Expose a parameter for the update period
   // TODO(MXG): We can probably do something smarter to decide when to update
@@ -687,6 +774,40 @@ void ScheduleNode::setup_conflict_topics_and_thread()
   // Initial conflict-free publication
   negotiation_stasuses_pub->publish(NegotiationStatuses{});
 
+  if (defer_lift_ride_conflicts)
+  {
+    building_map_sub = create_subscription<BuildingMap>(
+      "map", single_reliable_transient_local,
+      [this](const BuildingMap::ConstSharedPtr msg)
+      {
+        std::vector<LiftCabin> cabins;
+        for (const auto& lift : msg->lifts)
+        {
+          for (const auto& level : lift.levels)
+          {
+            cabins.push_back(
+              LiftCabin{
+                level,
+                lift.ref_x,
+                lift.ref_y,
+                lift.ref_yaw,
+                lift.width / 2.0,
+                lift.depth / 2.0
+              });
+          }
+        }
+
+        RCLCPP_INFO(
+          get_logger(),
+          "Loaded %lu lift cabin footprints from %lu lifts for conflict "
+          "filtering",
+          cabins.size(), msg->lifts.size());
+
+        std::lock_guard<std::mutex> lock(lift_cabins_mutex);
+        lift_cabins = std::move(cabins);
+      });
+  }
+
   conflict_check_quit = false;
   conflict_check_thread = std::thread(
     [&]()
@@ -704,6 +825,12 @@ void ScheduleNode::setup_conflict_topics_and_thread()
           filter.now = rmf_traffic_ros2::convert(now());
           filter.horizon = conflict_horizon;
           filter.min_free_waypoints = deferred_conflict_min_free_waypoints;
+          filter.cabin_margin = lift_cabin_margin;
+          if (defer_lift_ride_conflicts)
+          {
+            std::lock_guard<std::mutex> lock(lift_cabins_mutex);
+            filter.cabins = lift_cabins;
+          }
           return filter;
         };
 
