@@ -295,6 +295,8 @@ public:
   using BuildingMap = rmf_building_map_msgs::msg::BuildingMap;
   rclcpp::Subscription<BuildingMap>::SharedPtr building_map_sub;
   
+  std::optional<rmf_traffic::Duration> max_negotiation_duration;
+  
   using ConflictAck = rmf_traffic_msgs::msg::NegotiationAck;
   using ConflictAckSub = rclcpp::Subscription<ConflictAck>;
   ConflictAckSub::SharedPtr conflict_ack_sub;

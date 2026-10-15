@@ -451,6 +451,17 @@ ScheduleNode::ScheduleNode(
   defer_lift_ride_conflicts =
     declare_parameter<bool>("defer_lift_ride_conflicts", true);
   lift_cabin_margin = declare_parameter<double>("lift_cabin_margin", 0.1);
+  
+  // Negotiations still receiving responses are ended once they have run this
+  // many seconds, so participants that never converge can replan. Zero or
+  // negative disables the cap.
+  const double max_negotiation_sec =
+    declare_parameter<double>("max_negotiation_duration_sec", 120.0);
+  if (max_negotiation_sec > 0.0)
+  {
+    max_negotiation_duration =
+      rmf_traffic::time::from_seconds(max_negotiation_sec);
+  }
 
   const std::string horizon_str = conflict_horizon.has_value() ?
     std::to_string(horizon_sec) + "s" : "disabled";
@@ -1302,13 +1313,16 @@ void ScheduleNode::cull()
           cull_negotiation.push_back(v);
         }
         // A negotiation with many participants can keep receiving messages
-        // without ever converging, which keeps last_active_time fresh. Put a
-        // hard cap on its total duration so the participants can replan.
-        else if (open->start_time + std::chrono::seconds(60) <= time)
+        // without ever converging, which keeps last_active_time fresh. Cap its
+        // total duration so the participants can replan.
+        else if (max_negotiation_duration.has_value() &&
+          open->start_time + *max_negotiation_duration <= time)
         {
           RCLCPP_WARN(
             get_logger(),
-            "Negotiation %lu has exceeded the maximum duration of 60s", v);
+            "Negotiation %lu is still receiving responses but has exceeded the "
+            "maximum duration of %.1fs", v,
+            rmf_traffic::time::to_seconds(*max_negotiation_duration));
           cull_negotiation.push_back(v);
         }
       }
