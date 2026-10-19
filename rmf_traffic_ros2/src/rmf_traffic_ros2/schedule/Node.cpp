@@ -988,21 +988,31 @@ void ScheduleNode::setup_conflict_topics_and_thread()
             view_changes, mirror, filter, deferred_conflicts);
         }
 
+        std::vector<ConflictSet> due;
         if (recheck_due)
         {
           next_deferred_recheck =
             std::chrono::steady_clock::now() + deferred_conflict_recheck_period;
-          auto due = recheck_deferred_conflicts(
+          due = recheck_deferred_conflicts(
             deferred_conflicts, mirror, filter);
-          conflicts.insert(conflicts.end(), due.begin(), due.end());
         }
 
-        const auto new_negotiations = insert_conflicts(
-          std::move(conflicts), mirror, deferred_conflicts,
+        const auto skip_dependent =
           [&filter](const rmf_traffic::schedule::ItineraryView& itinerary)
           {
             return riding_lift(itinerary, filter);
-          });
+          };
+
+        auto new_negotiations = insert_conflicts(
+          std::move(conflicts), mirror, deferred_conflicts, skip_dependent);
+
+        // A retried pair waits for any open negotiation of its participants to
+        // finish rather than joining it. Joining is how forfeited pairs kept
+        // growing one negotiation until a fleet adapter ran out of memory.
+        const auto retried_negotiations = insert_conflicts(
+          std::move(due), mirror, deferred_conflicts, skip_dependent, false);
+        new_negotiations.insert(
+          retried_negotiations.begin(), retried_negotiations.end());
 
         // The negotiation pointers and active_conflicts are also modified by
         // the negotiation callbacks, so hold the lock while reading them.
@@ -1039,7 +1049,8 @@ ScheduleNode::insert_conflicts(
   std::vector<ConflictSet> conflicts,
   const rmf_traffic::schedule::Mirror& mirror,
   std::set<std::pair<ParticipantId, ParticipantId>>& deferred,
-  const SkipDependent& skip_dependent)
+  const SkipDependent& skip_dependent,
+  const bool join_open)
 {
   std::unordered_map<Version, const Negotiation*> new_negotiations;
   for (auto& conflict : conflicts)
@@ -1095,12 +1106,14 @@ ScheduleNode::insert_conflicts(
     const bool waiting = std::any_of(
       conflict.begin(), conflict.end(), [&](const auto p)
       {
-        return active_conflicts._waiting.count(p) > 0;
+        return active_conflicts._waiting.count(p) > 0
+        || (!join_open && active_conflicts._version.count(p) > 0);
       });
     if (waiting)
     {
       // Both detection paths remove imminent pairs before insertion. Restore
-      // them if a participant (including a dependency) is awaiting an update.
+      // them if a participant (including a dependency) is awaiting an update,
+      // or, for a retried pair, is already in an open negotiation.
       // An acknowledgment without an update, or wait culling, does not change
       // the itinerary and therefore cannot rediscover this conflict for us.
       deferred.insert(pair);
