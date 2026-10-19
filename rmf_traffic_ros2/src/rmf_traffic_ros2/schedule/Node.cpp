@@ -170,6 +170,37 @@ bool riding_lift(
 }
 
 //==============================================================================
+// True if the route places the participant inside a lift cabin at the given
+// time.
+bool in_cabin_at(
+  const rmf_traffic::Route& route,
+  const rmf_traffic::Time time,
+  const ConflictFilter& filter)
+{
+  if (filter.cabins.empty())
+    return false;
+
+  const auto& trajectory = route.trajectory();
+  const auto* start = trajectory.start_time();
+  const auto* finish = trajectory.finish_time();
+  if (!start || !finish || time < *start || *finish < time)
+    return false;
+
+  const Eigen::Vector3d p = trajectory.size() < 2 ?
+    trajectory.back().position() :
+    rmf_traffic::Motion::compute_cubic_splines(trajectory)
+    ->compute_position(time);
+
+  for (const auto& cabin : filter.cabins)
+  {
+    if (cabin.map == route.map() && inside_cabin(cabin, p, filter.cabin_margin))
+      return true;
+  }
+
+  return false;
+}
+
+//==============================================================================
 // Number of waypoints a participant still has to pass before reaching the
 // conflict. A route that has not started yet counts from its first waypoint.
 // Zero when it is already at or past the conflict waypoint.
@@ -210,13 +241,11 @@ ParticipantPair make_pair_key(
 // the same filters as upstream RMF, then the lift ride and horizon filters.
 ConflictKind classify_route_pair(
   const rmf_traffic::schedule::ParticipantDescription& desc_a,
-  const rmf_traffic::schedule::ItineraryView& itinerary_a,
   const rmf_traffic::Route& route_a,
   const rmf_traffic::ParticipantId a,
   const rmf_traffic::PlanId plan_a,
   const rmf_traffic::RouteId r_a,
   const rmf_traffic::schedule::ParticipantDescription& desc_b,
-  const rmf_traffic::schedule::ItineraryView& itinerary_b,
   const rmf_traffic::Route& route_b,
   const rmf_traffic::ParticipantId b,
   const rmf_traffic::PlanId plan_b,
@@ -245,10 +274,13 @@ ConflictKind classify_route_pair(
   if (!found_conflict.has_value())
     return ConflictKind::None;
 
-  // A participant riding a lift cannot do anything about a conflict, so
-  // negotiating would only end in a forfeit. Ignore the conflict entirely
-  // rather than holding it until the ride is over.
-  if (riding_lift(itinerary_a, filter) || riding_lift(itinerary_b, filter))
+  // Ignore conflicts where either participant is inside a lift cabin at the
+  // time of the conflict, e.g. against a robot at the lift door, or on another
+  // floor since a ride is scheduled on both maps. The robot in the cabin
+  // cannot yield, so negotiating would only end in a forfeit. Conflicts where
+  // both are outside a cabin, such as after the ride, are kept.
+  if (in_cabin_at(route_a, found_conflict->time, filter)
+    || in_cabin_at(route_b, found_conflict->time, filter))
     return ConflictKind::None;
 
   if (filter.horizon.has_value())
@@ -316,8 +348,8 @@ std::vector<ScheduleNode::ConflictSet> recheck_deferred_conflicts(
       for (std::size_t r_b = 0; r_b < itinerary_b->size(); ++r_b)
       {
         const auto kind = classify_route_pair(
-          *desc_a, *itinerary_a, *(*itinerary_a)[r_a], a, *plan_a, r_a,
-          *desc_b, *itinerary_b, *(*itinerary_b)[r_b], b, *plan_b, r_b,
+          *desc_a, *(*itinerary_a)[r_a], a, *plan_a, r_a,
+          *desc_b, *(*itinerary_b)[r_b], b, *plan_b, r_b,
           filter);
 
         if (kind == ConflictKind::Imminent)
@@ -381,17 +413,13 @@ std::vector<ScheduleNode::ConflictSet> get_conflicts(
         continue;
       }
 
-      const auto other_itinerary =
-        viewer.get_itinerary(vc->participant)
-        .value_or(rmf_traffic::schedule::ItineraryView{});
-
       for (std::size_t r = 0; r < itinerary.size(); ++r)
       {
         const auto& route = itinerary[r];
         assert(route);
         const auto kind = classify_route_pair(
-          *description, itinerary, *route, participant, plan_id, r,
-          vc->description, other_itinerary, *vc->route, vc->participant,
+          *description, *route, participant, plan_id, r,
+          vc->description, *vc->route, vc->participant,
           vc->plan_id, vc->route_id,
           filter);
 
