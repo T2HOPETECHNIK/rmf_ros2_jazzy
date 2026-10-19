@@ -294,8 +294,8 @@ public:
   std::chrono::steady_clock::duration deferred_conflict_recheck_period;
   std::size_t deferred_conflict_min_free_waypoints;
 
-  // Conflicts of a participant that is riding a lift are deferred until the
-  // ride is over, since it cannot act on them from inside the cabin.
+  // Conflicts where a participant is inside a lift cabin at the time of the
+  // conflict are ignored, since it cannot yield from there.
   bool defer_lift_ride_conflicts = true;
   double lift_cabin_margin = 0.0;
   // How long after its itinerary ends a participant whose last position is
