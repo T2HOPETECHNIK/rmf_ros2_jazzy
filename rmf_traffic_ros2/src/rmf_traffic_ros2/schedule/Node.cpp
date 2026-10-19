@@ -245,11 +245,11 @@ ConflictKind classify_route_pair(
   if (!found_conflict.has_value())
     return ConflictKind::None;
 
-  // A participant riding a lift cannot do anything about a conflict until it
-  // leaves the cabin, so negotiating now would only end in a forfeit. Defer
-  // the conflict and negotiate it once the ride is over.
+  // A participant riding a lift cannot do anything about a conflict, so
+  // negotiating would only end in a forfeit. Ignore the conflict entirely
+  // rather than holding it until the ride is over.
   if (riding_lift(itinerary_a, filter) || riding_lift(itinerary_b, filter))
-    return ConflictKind::Deferred;
+    return ConflictKind::None;
 
   if (filter.horizon.has_value())
   {
@@ -465,7 +465,7 @@ ScheduleNode::ScheduleNode(
   deferred_conflict_min_free_waypoints =
     static_cast<std::size_t>(std::max(min_free_waypoints_param, 0));
 
-  // Defer conflicts of participants that are riding a lift
+  // Ignore conflicts of participants that are riding a lift
   defer_lift_ride_conflicts =
     declare_parameter<bool>("defer_lift_ride_conflicts", true);
   lift_cabin_margin = declare_parameter<double>("lift_cabin_margin", 0.1);
