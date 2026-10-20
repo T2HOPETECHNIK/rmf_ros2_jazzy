@@ -1008,13 +1008,18 @@ void ScheduleNode::setup_conflict_topics_and_thread()
         // able to join one, or they could wait past their conflict time.
         // A schedule change can re-detect a retried pair too, so partition the
         // whole batch rather than only the periodic recheck results.
+        // get_conflicts can report a pair once per conflicting route, so keep
+        // only one copy of each retried pair. A later copy would find the
+        // negotiation opened by the first and defer the pair again.
         std::vector<ConflictSet> retried;
+        std::set<ParticipantPair> retried_seen;
         for (auto it = conflicts.begin(); it != conflicts.end(); )
         {
-          if (retried_conflicts.count(
-              make_pair_key(*it->begin(), *std::next(it->begin()))) > 0)
+          const auto key = make_pair_key(*it->begin(), *std::next(it->begin()));
+          if (retried_conflicts.count(key) > 0)
           {
-            retried.push_back(std::move(*it));
+            if (retried_seen.insert(key).second)
+              retried.push_back(std::move(*it));
             it = conflicts.erase(it);
           }
           else
