@@ -1143,6 +1143,16 @@ ScheduleNode::insert_conflicts(
     }
 
     std::unique_lock<std::mutex> lock(active_conflicts_mutex);
+    // A refusal or timeout can queue this pair after the conflict thread's
+    // last retry drain. Leave it queued for the next retry pass instead of
+    // allowing this ordinary insertion to join an open negotiation. Keep
+    // this check and insertion under the same lock as the callbacks.
+    if (join_open && active_conflicts._retry.count(pair) > 0)
+    {
+      deferred.insert(pair);
+      continue;
+    }
+
     const bool waiting = std::any_of(
       conflict.begin(), conflict.end(), [&](const auto p)
       {
