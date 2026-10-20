@@ -1001,22 +1001,25 @@ void ScheduleNode::setup_conflict_topics_and_thread()
             deferred_conflicts, mirror, filter);
         }
 
+        conflicts.insert(conflicts.end(), due.begin(), due.end());
+
         // Only pairs retried after a failed negotiation stay out of open
         // negotiations. Pairs promoted from beyond the horizon must still be
         // able to join one, or they could wait past their conflict time.
+        // A schedule change can re-detect a retried pair too, so partition the
+        // whole batch rather than only the periodic recheck results.
         std::vector<ConflictSet> retried;
-        for (auto it = due.begin(); it != due.end(); )
+        for (auto it = conflicts.begin(); it != conflicts.end(); )
         {
           if (retried_conflicts.count(
               make_pair_key(*it->begin(), *std::next(it->begin()))) > 0)
           {
             retried.push_back(std::move(*it));
-            it = due.erase(it);
+            it = conflicts.erase(it);
           }
           else
             ++it;
         }
-        conflicts.insert(conflicts.end(), due.begin(), due.end());
 
         const auto skip_dependent =
           [&filter](const rmf_traffic::schedule::ItineraryView& itinerary)
