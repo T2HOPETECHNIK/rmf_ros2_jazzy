@@ -866,6 +866,8 @@ void ScheduleNode::setup_conflict_topics_and_thread()
 
       // Conflicts that were found beyond the horizon, re-checked periodically
       std::set<ParticipantPair> deferred_conflicts;
+      // Deferred pairs whose negotiation was refused or timed out
+      std::set<ParticipantPair> retried_conflicts;
       auto next_deferred_recheck = std::chrono::steady_clock::now();
 
       const auto make_filter = [&]()
@@ -890,6 +892,8 @@ void ScheduleNode::setup_conflict_topics_and_thread()
           // Pairs whose negotiation was refused or timed out
           std::lock_guard<std::mutex> lock(active_conflicts_mutex);
           deferred_conflicts.insert(
+            active_conflicts._retry.begin(), active_conflicts._retry.end());
+          retried_conflicts.insert(
             active_conflicts._retry.begin(), active_conflicts._retry.end());
           active_conflicts._retry.clear();
         }
@@ -988,21 +992,67 @@ void ScheduleNode::setup_conflict_topics_and_thread()
             view_changes, mirror, filter, deferred_conflicts);
         }
 
+        std::vector<ConflictSet> due;
         if (recheck_due)
         {
           next_deferred_recheck =
             std::chrono::steady_clock::now() + deferred_conflict_recheck_period;
-          auto due = recheck_deferred_conflicts(
+          due = recheck_deferred_conflicts(
             deferred_conflicts, mirror, filter);
-          conflicts.insert(conflicts.end(), due.begin(), due.end());
         }
 
-        const auto new_negotiations = insert_conflicts(
-          std::move(conflicts), mirror, deferred_conflicts,
+        conflicts.insert(conflicts.end(), due.begin(), due.end());
+
+        // Only pairs retried after a failed negotiation stay out of open
+        // negotiations. Pairs promoted from beyond the horizon must still be
+        // able to join one, or they could wait past their conflict time.
+        // A schedule change can re-detect a retried pair too, so partition the
+        // whole batch rather than only the periodic recheck results.
+        // get_conflicts can report a pair once per conflicting route, so keep
+        // only one copy of each retried pair. A later copy would find the
+        // negotiation opened by the first and defer the pair again.
+        std::vector<ConflictSet> retried;
+        std::set<ParticipantPair> retried_seen;
+        for (auto it = conflicts.begin(); it != conflicts.end(); )
+        {
+          const auto key = make_pair_key(*it->begin(), *std::next(it->begin()));
+          if (retried_conflicts.count(key) > 0)
+          {
+            if (retried_seen.insert(key).second)
+              retried.push_back(std::move(*it));
+            it = conflicts.erase(it);
+          }
+          else
+            ++it;
+        }
+
+        const auto skip_dependent =
           [&filter](const rmf_traffic::schedule::ItineraryView& itinerary)
           {
             return riding_lift(itinerary, filter);
-          });
+          };
+
+        auto new_negotiations = insert_conflicts(
+          std::move(conflicts), mirror, deferred_conflicts, skip_dependent);
+
+        // A retried pair waits for any open negotiation of its participants to
+        // finish rather than joining it. Joining is how forfeited pairs kept
+        // growing one negotiation until a fleet adapter ran out of memory.
+        const auto retried_negotiations = insert_conflicts(
+          std::move(retried), mirror, deferred_conflicts, skip_dependent,
+          false);
+        new_negotiations.insert(
+          retried_negotiations.begin(), retried_negotiations.end());
+
+        // A retried pair stops being one once it has left the deferred set,
+        // either by entering a negotiation or by no longer conflicting.
+        for (auto it = retried_conflicts.begin(); it != retried_conflicts.end(); )
+        {
+          if (deferred_conflicts.count(*it) == 0)
+            it = retried_conflicts.erase(it);
+          else
+            ++it;
+        }
 
         // The negotiation pointers and active_conflicts are also modified by
         // the negotiation callbacks, so hold the lock while reading them.
@@ -1039,7 +1089,8 @@ ScheduleNode::insert_conflicts(
   std::vector<ConflictSet> conflicts,
   const rmf_traffic::schedule::Mirror& mirror,
   std::set<std::pair<ParticipantId, ParticipantId>>& deferred,
-  const SkipDependent& skip_dependent)
+  const SkipDependent& skip_dependent,
+  const bool join_open)
 {
   std::unordered_map<Version, const Negotiation*> new_negotiations;
   for (auto& conflict : conflicts)
@@ -1092,15 +1143,27 @@ ScheduleNode::insert_conflicts(
     }
 
     std::unique_lock<std::mutex> lock(active_conflicts_mutex);
+    // A refusal or timeout can queue this pair after the conflict thread's
+    // last retry drain. Leave it queued for the next retry pass instead of
+    // allowing this ordinary insertion to join an open negotiation. Keep
+    // this check and insertion under the same lock as the callbacks.
+    if (join_open && active_conflicts._retry.count(pair) > 0)
+    {
+      deferred.insert(pair);
+      continue;
+    }
+
     const bool waiting = std::any_of(
       conflict.begin(), conflict.end(), [&](const auto p)
       {
-        return active_conflicts._waiting.count(p) > 0;
+        return active_conflicts._waiting.count(p) > 0
+        || (!join_open && active_conflicts._version.count(p) > 0);
       });
     if (waiting)
     {
       // Both detection paths remove imminent pairs before insertion. Restore
-      // them if a participant (including a dependency) is awaiting an update.
+      // them if a participant (including a dependency) is awaiting an update,
+      // or, for a retried pair, is already in an open negotiation.
       // An acknowledgment without an update, or wait culling, does not change
       // the itinerary and therefore cannot rediscover this conflict for us.
       deferred.insert(pair);

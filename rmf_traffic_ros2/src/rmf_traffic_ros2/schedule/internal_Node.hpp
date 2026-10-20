@@ -601,13 +601,16 @@ public:
   // negotiation wait are retained for periodic rechecking without an update.
   // Dependents for which skip_dependent returns true (e.g. riding a lift) are
   // not pulled into the negotiation, since they cannot respond to it.
+  // When join_open is false, a pair whose participants (or dependents) are
+  // already in an open negotiation is retained instead of being added to it.
   using SkipDependent =
     std::function<bool(const rmf_traffic::schedule::ItineraryView&)>;
   std::unordered_map<Version, const Negotiation*> insert_conflicts(
     std::vector<ConflictSet> conflicts,
     const rmf_traffic::schedule::Mirror& mirror,
     std::set<std::pair<ParticipantId, ParticipantId>>& deferred,
-    const SkipDependent& skip_dependent = nullptr);
+    const SkipDependent& skip_dependent = nullptr,
+    bool join_open = true);
 
   virtual void setup_conflict_topics_and_thread();
   void setup_cull_timer();
