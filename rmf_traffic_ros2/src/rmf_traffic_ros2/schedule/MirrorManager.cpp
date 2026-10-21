@@ -800,12 +800,18 @@ public:
     // keep resending until a response arrives. Only the first response is
     // used to fulfill the promise.
     const auto retry_period = std::chrono::seconds(5);
+
+    // Convert the query once up front. Once a response fulfills the promise,
+    // get() may move the query away, so it must not be read again here.
+    const auto register_query_request =
+      std::make_shared<RegisterQuery::Request>();
+    if (ready && !abandon_discovery)
+      register_query_request->query = convert(query);
+
     while (ready && !abandon_discovery && !registration_received)
     {
-      RegisterQuery::Request register_query_request;
-      register_query_request.query = convert(query);
       register_query_client->async_send_request(
-        std::make_shared<RegisterQuery::Request>(register_query_request),
+        register_query_request,
         [this](const RegisterQueryFuture response)
         {
           const auto node = weak_node.lock();
