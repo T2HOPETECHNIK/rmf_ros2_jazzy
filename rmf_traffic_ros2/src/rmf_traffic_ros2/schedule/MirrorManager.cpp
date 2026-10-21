@@ -761,6 +761,7 @@ public:
 
   std::atomic_bool abandon_discovery;
   std::atomic_bool registration_sent;
+  std::atomic_bool registration_received;
   std::thread discovery_thread;
 
   std::future<RegisterQuery::Response> registration_future;
@@ -774,7 +775,8 @@ public:
     query(std::move(_query)),
     options(std::move(_options)),
     abandon_discovery(false),
-    registration_sent(false)
+    registration_sent(false),
+    registration_received(false)
   {
     register_query_client =
       node->create_client<RegisterQuery>(RegisterQueryServiceName);
@@ -793,18 +795,24 @@ public:
       ready = register_query_client->wait_for_service(timeout);
     }
 
-    // If the schedule node falls over right now, the promise will never be
-    // fulfilled. The user must handle this possibility.
-    if (ready && !abandon_discovery)
+    // The response to a registration request can be lost (e.g. the response
+    // is dropped while discovery is still settling during a busy launch), so
+    // keep resending until a response arrives. Only the first response is
+    // used to fulfill the promise.
+    const auto retry_period = std::chrono::seconds(5);
+    while (ready && !abandon_discovery && !registration_received)
     {
       RegisterQuery::Request register_query_request;
       register_query_request.query = convert(query);
       register_query_client->async_send_request(
         std::make_shared<RegisterQuery::Request>(register_query_request),
-        [&](const RegisterQueryFuture response)
+        [this](const RegisterQueryFuture response)
         {
           const auto node = weak_node.lock();
           if (!node)
+            return;
+
+          if (registration_received.exchange(true))
             return;
 
           try
@@ -821,6 +829,25 @@ public:
           }
         });
       registration_sent = true;
+
+      const auto deadline = std::chrono::steady_clock::now() + retry_period;
+      while (!abandon_discovery && !registration_received
+        && std::chrono::steady_clock::now() < deadline)
+      {
+        std::this_thread::sleep_for(timeout);
+      }
+
+      if (!abandon_discovery && !registration_received)
+      {
+        if (const auto node = weak_node.lock())
+        {
+          RCLCPP_WARN(
+            node->get_logger(),
+            "[rmf_traffic_ros2::MirrorManagerFuture] No response to query "
+            "registration after %lds, resending request",
+            static_cast<long>(retry_period.count()));
+        }
+      }
     }
   }
 
