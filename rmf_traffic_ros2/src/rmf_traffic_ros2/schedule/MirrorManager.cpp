@@ -825,8 +825,9 @@ public:
 
     // The response to a registration request can be lost (e.g. the response
     // is dropped while discovery is still settling during a busy launch), so
-    // keep resending until a response arrives. Only the first response is
-    // used to fulfill the promise.
+    // keep resending until a response arrives. Earlier requests stay pending
+    // so a late response to any of them still counts. Only the first response
+    // is used to fulfill the promise.
     const auto retry_period = options.registration_retry_period();
 
     // Convert the query once up front. Once a response fulfills the promise,
@@ -836,6 +837,7 @@ public:
     if (ready && !abandon_discovery)
       register_query_request->query = convert(query);
 
+    std::vector<int64_t> pending_request_ids;
     while (ready && !abandon_discovery && !registration_received)
     {
       const auto pending = register_query_client->async_send_request(
@@ -865,6 +867,7 @@ public:
               e.what());
           }
         });
+      pending_request_ids.push_back(pending.request_id);
       registration_sent = true;
 
       const auto deadline = std::chrono::steady_clock::now() + retry_period;
@@ -873,11 +876,6 @@ public:
       {
         std::this_thread::sleep_for(timeout);
       }
-
-      // The client keeps every unanswered request until it gets a reply, so
-      // drop this one before resending or giving up.
-      if (!registration_received)
-        register_query_client->remove_pending_request(pending.request_id);
 
       if (!abandon_discovery && !registration_received)
       {
@@ -891,6 +889,11 @@ public:
         }
       }
     }
+
+    // The client keeps every unanswered request until it gets a reply, so
+    // drop the ones that are still outstanding now that we are done.
+    for (const auto id : pending_request_ids)
+      register_query_client->remove_pending_request(id);
   }
 
   void wait() const
