@@ -15,6 +15,7 @@
  *
 */
 
+#include <algorithm>
 #include <chrono>
 
 #include <rclcpp/logger.hpp>
@@ -828,7 +829,10 @@ public:
     // keep resending until a response arrives. Earlier requests stay pending
     // so a late response to any of them still counts. Only the first response
     // is used to fulfill the promise.
-    const auto retry_period = options.registration_retry_period();
+    // A non-positive period would resend as fast as the CPU allows.
+    const auto retry_period = std::max(
+      options.registration_retry_period(),
+      rmf_traffic::Duration(std::chrono::milliseconds(100)));
 
     // Convert the query once up front. Once a response fulfills the promise,
     // get() may move the query away, so it must not be read again here.
