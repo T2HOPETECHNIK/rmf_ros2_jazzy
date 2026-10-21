@@ -279,6 +279,17 @@ public:
 
   void execute(const LiftDoorOpen& open) final
   {
+    // Do not publish anything past the destination cabin while the robot is
+    // riding. The planned ride time is far shorter than a real ride, so the
+    // route out of the lift would appear on the destination floor long before
+    // the robot gets there, and robots on that floor would wait for it or
+    // negotiate with it. The rest of the itinerary is published once the lift
+    // arrives.
+    truncate_arrival(*_previous_itinerary, initial_waypoint);
+
+    _previous_itinerary =
+      std::make_shared<rmf_traffic::schedule::Itinerary>(_full_itinerary);
+
     std::string name;
     const auto& graph = _context->navigation_graph();
     const auto i1 = initial_waypoint.graph_index();
@@ -313,7 +324,8 @@ public:
           _event_start_time + open.duration() + _lifting_duration,
           phases::RequestLift::Located::Inside,
           _plan_id,
-          localize
+          localize,
+          _previous_itinerary
         }),
       _event_start_time, initial_waypoint.dependencies(), std::nullopt);
     _moving_lift = false;

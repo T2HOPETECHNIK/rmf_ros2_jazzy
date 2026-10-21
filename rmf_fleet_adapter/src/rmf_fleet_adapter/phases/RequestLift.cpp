@@ -473,6 +473,15 @@ bool RequestLift::ActivePhase::_finish()
     return false;
   }
 
+  if (_data.resume_itinerary)
+  {
+    // The lift has arrived at the destination, so publish the route out of
+    // the lift that was held back during the ride.
+    _context->schedule_itinerary(_data.plan_id, *_data.resume_itinerary);
+    const auto delay = _context->now() - _data.expected_finish;
+    _context->itinerary().cumulative_delay(*_data.plan_id, delay);
+  }
+
   return true;
 }
 
