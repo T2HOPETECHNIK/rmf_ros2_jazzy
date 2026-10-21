@@ -15,6 +15,7 @@
  *
 */
 
+#include <algorithm>
 #include <chrono>
 
 #include <rclcpp/logger.hpp>
@@ -160,13 +161,9 @@ public:
     // 1. The node of the incoming msg is the same as the one we're expecting
     // 2. The node of the incoming msg is supplanting the one we're expecting
     const bool expected_node = schedule_node_id.node_uuid == node_id.node_uuid;
+    // reconnect_schedule() also reconnects the services if a new node has
+    // appeared.
     const bool new_node = reconnect_schedule(node_id);
-
-    if (new_node)
-    {
-      // If a new node has appeared, we should reconnect the services.
-      reconnect_services();
-    }
 
     return expected_node || new_node;
   }
@@ -669,6 +666,8 @@ public:
 
   bool update_on_wakeup;
 
+  rmf_traffic::Duration registration_retry_period = std::chrono::seconds(5);
+
 };
 
 //==============================================================================
@@ -707,6 +706,20 @@ bool MirrorManager::Options::update_on_wakeup() const
 auto MirrorManager::Options::update_on_wakeup(bool choice) -> Options&
 {
   _pimpl->update_on_wakeup = choice;
+  return *this;
+}
+
+//==============================================================================
+rmf_traffic::Duration MirrorManager::Options::registration_retry_period() const
+{
+  return _pimpl->registration_retry_period;
+}
+
+//==============================================================================
+auto MirrorManager::Options::registration_retry_period(
+  rmf_traffic::Duration period) -> Options&
+{
+  _pimpl->registration_retry_period = period;
   return *this;
 }
 
@@ -761,6 +774,7 @@ public:
 
   std::atomic_bool abandon_discovery;
   std::atomic_bool registration_sent;
+  std::atomic_bool registration_received;
   std::thread discovery_thread;
 
   std::future<RegisterQuery::Response> registration_future;
@@ -774,7 +788,8 @@ public:
     query(std::move(_query)),
     options(std::move(_options)),
     abandon_discovery(false),
-    registration_sent(false)
+    registration_sent(false),
+    registration_received(false)
   {
     register_query_client =
       node->create_client<RegisterQuery>(RegisterQueryServiceName);
@@ -786,6 +801,22 @@ public:
 
   void discover()
   {
+    // An exception escaping the thread would call std::terminate, e.g. when
+    // wait_for_service() throws because the context shut down. Hand it to
+    // whoever is waiting on the future instead.
+    try
+    {
+      discover_impl();
+    }
+    catch (...)
+    {
+      if (!registration_received.exchange(true))
+        registration_promise.set_exception(std::current_exception());
+    }
+  }
+
+  void discover_impl()
+  {
     const auto timeout = std::chrono::milliseconds(10);
     bool ready = false;
     while (!abandon_discovery && !ready)
@@ -793,18 +824,35 @@ public:
       ready = register_query_client->wait_for_service(timeout);
     }
 
-    // If the schedule node falls over right now, the promise will never be
-    // fulfilled. The user must handle this possibility.
+    // The response to a registration request can be lost (e.g. the response
+    // is dropped while discovery is still settling during a busy launch), so
+    // keep resending until a response arrives. Earlier requests stay pending
+    // so a late response to any of them still counts. Only the first response
+    // is used to fulfill the promise.
+    // A non-positive period would resend as fast as the CPU allows.
+    const auto retry_period = std::max(
+      options.registration_retry_period(),
+      rmf_traffic::Duration(std::chrono::milliseconds(100)));
+
+    // Convert the query once up front. Once a response fulfills the promise,
+    // get() may move the query away, so it must not be read again here.
+    const auto register_query_request =
+      std::make_shared<RegisterQuery::Request>();
     if (ready && !abandon_discovery)
+      register_query_request->query = convert(query);
+
+    std::vector<int64_t> pending_request_ids;
+    while (ready && !abandon_discovery && !registration_received)
     {
-      RegisterQuery::Request register_query_request;
-      register_query_request.query = convert(query);
-      register_query_client->async_send_request(
-        std::make_shared<RegisterQuery::Request>(register_query_request),
-        [&](const RegisterQueryFuture response)
+      const auto pending = register_query_client->async_send_request(
+        register_query_request,
+        [this](const RegisterQueryFuture response)
         {
           const auto node = weak_node.lock();
           if (!node)
+            return;
+
+          if (registration_received.exchange(true))
             return;
 
           try
@@ -813,6 +861,9 @@ public:
           }
           catch (const std::exception& e)
           {
+            // Retries have stopped, so pass the error on to whoever is
+            // waiting on the future instead of leaving it unresolved.
+            registration_promise.set_exception(std::current_exception());
             RCLCPP_ERROR(
               node->get_logger(),
               "[rmf_traffic_ros2::MirrorManagerFuture] Exception while "
@@ -820,8 +871,33 @@ public:
               e.what());
           }
         });
+      pending_request_ids.push_back(pending.request_id);
       registration_sent = true;
+
+      const auto deadline = std::chrono::steady_clock::now() + retry_period;
+      while (!abandon_discovery && !registration_received
+        && std::chrono::steady_clock::now() < deadline)
+      {
+        std::this_thread::sleep_for(timeout);
+      }
+
+      if (!abandon_discovery && !registration_received)
+      {
+        if (const auto node = weak_node.lock())
+        {
+          RCLCPP_WARN(
+            node->get_logger(),
+            "[rmf_traffic_ros2::MirrorManagerFuture] No response to query "
+            "registration after %.1fs, resending request",
+            rmf_traffic::time::to_seconds(retry_period));
+        }
+      }
     }
+
+    // The client keeps every unanswered request until it gets a reply, so
+    // drop the ones that are still outstanding now that we are done.
+    for (const auto id : pending_request_ids)
+      register_query_client->remove_pending_request(id);
   }
 
   void wait() const
