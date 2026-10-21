@@ -160,13 +160,9 @@ public:
     // 1. The node of the incoming msg is the same as the one we're expecting
     // 2. The node of the incoming msg is supplanting the one we're expecting
     const bool expected_node = schedule_node_id.node_uuid == node_id.node_uuid;
+    // reconnect_schedule() also reconnects the services if a new node has
+    // appeared.
     const bool new_node = reconnect_schedule(node_id);
-
-    if (new_node)
-    {
-      // If a new node has appeared, we should reconnect the services.
-      reconnect_services();
-    }
 
     return expected_node || new_node;
   }
@@ -669,6 +665,8 @@ public:
 
   bool update_on_wakeup;
 
+  rmf_traffic::Duration registration_retry_period = std::chrono::seconds(5);
+
 };
 
 //==============================================================================
@@ -707,6 +705,20 @@ bool MirrorManager::Options::update_on_wakeup() const
 auto MirrorManager::Options::update_on_wakeup(bool choice) -> Options&
 {
   _pimpl->update_on_wakeup = choice;
+  return *this;
+}
+
+//==============================================================================
+rmf_traffic::Duration MirrorManager::Options::registration_retry_period() const
+{
+  return _pimpl->registration_retry_period;
+}
+
+//==============================================================================
+auto MirrorManager::Options::registration_retry_period(
+  rmf_traffic::Duration period) -> Options&
+{
+  _pimpl->registration_retry_period = period;
   return *this;
 }
 
@@ -788,6 +800,22 @@ public:
 
   void discover()
   {
+    // An exception escaping the thread would call std::terminate, e.g. when
+    // wait_for_service() throws because the context shut down. Hand it to
+    // whoever is waiting on the future instead.
+    try
+    {
+      discover_impl();
+    }
+    catch (...)
+    {
+      if (!registration_received.exchange(true))
+        registration_promise.set_exception(std::current_exception());
+    }
+  }
+
+  void discover_impl()
+  {
     const auto timeout = std::chrono::milliseconds(10);
     bool ready = false;
     while (!abandon_discovery && !ready)
@@ -799,7 +827,7 @@ public:
     // is dropped while discovery is still settling during a busy launch), so
     // keep resending until a response arrives. Only the first response is
     // used to fulfill the promise.
-    const auto retry_period = std::chrono::seconds(5);
+    const auto retry_period = options.registration_retry_period();
 
     // Convert the query once up front. Once a response fulfills the promise,
     // get() may move the query away, so it must not be read again here.
@@ -810,7 +838,7 @@ public:
 
     while (ready && !abandon_discovery && !registration_received)
     {
-      register_query_client->async_send_request(
+      const auto pending = register_query_client->async_send_request(
         register_query_request,
         [this](const RegisterQueryFuture response)
         {
@@ -827,6 +855,9 @@ public:
           }
           catch (const std::exception& e)
           {
+            // Retries have stopped, so pass the error on to whoever is
+            // waiting on the future instead of leaving it unresolved.
+            registration_promise.set_exception(std::current_exception());
             RCLCPP_ERROR(
               node->get_logger(),
               "[rmf_traffic_ros2::MirrorManagerFuture] Exception while "
@@ -843,6 +874,11 @@ public:
         std::this_thread::sleep_for(timeout);
       }
 
+      // The client keeps every unanswered request until it gets a reply, so
+      // drop this one before resending or giving up.
+      if (!registration_received)
+        register_query_client->remove_pending_request(pending.request_id);
+
       if (!abandon_discovery && !registration_received)
       {
         if (const auto node = weak_node.lock())
@@ -850,8 +886,8 @@ public:
           RCLCPP_WARN(
             node->get_logger(),
             "[rmf_traffic_ros2::MirrorManagerFuture] No response to query "
-            "registration after %lds, resending request",
-            static_cast<long>(retry_period.count()));
+            "registration after %.1fs, resending request",
+            rmf_traffic::time::to_seconds(retry_period));
         }
       }
     }

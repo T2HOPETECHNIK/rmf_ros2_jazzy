@@ -64,6 +64,14 @@ public:
     /// Toggle the choice to wakeup on an update.
     Options& update_on_wakeup(bool choice);
 
+    /// How long to wait for a reply to the initial query registration before
+    /// resending it. The default is 5 seconds.
+    rmf_traffic::Duration registration_retry_period() const;
+
+    /// Set how long to wait for a reply to the initial query registration
+    /// before resending it.
+    Options& registration_retry_period(rmf_traffic::Duration period);
+
     class Implementation;
   private:
     rmf_utils::impl_ptr<Implementation> _pimpl;
