@@ -34,6 +34,10 @@
 
 #include <rclcpp/logging.hpp>
 
+#include <chrono>
+#include <map>
+#include <mutex>
+
 namespace rmf_traffic_ros2 {
 namespace schedule {
 
@@ -84,18 +88,11 @@ public:
       Args&&... args)
     {
       auto responder = std::make_shared<Responder>(std::forward<Args>(args)...);
-      rclcpp::Node& node = responder->impl->node;
-      responder->timer = node.create_wall_timer(
-        responder->impl->timeout,
-        [r = std::weak_ptr<Responder>(responder)]()
-        {
-          if (auto responder = r.lock())
-          {
-            responder->timer.reset();
-            responder->timeout();
-          }
-        });
-
+      // A large negotiation creates a responder for every table. Giving each
+      // one its own rclcpp timer stalls the node, because adding a timer to a
+      // callback group scans all of the group's timers. The responders share a
+      // single timer instead.
+      responder->impl->add_responder_deadline(responder);
       return responder;
     }
 
@@ -205,7 +202,6 @@ public:
     const rmf_traffic::schedule::Negotiation::TablePtr parent;
     OptVersion parent_version;
 
-    rclcpp::TimerBase::SharedPtr timer;
     mutable bool responded = false;
 
   };
@@ -214,6 +210,40 @@ public:
   std::shared_ptr<const rmf_traffic::schedule::Snappable> viewer;
   std::shared_ptr<Worker> worker;
   rmf_traffic::Duration timeout = std::chrono::seconds(15);
+
+  std::mutex responder_deadlines_mutex;
+  std::multimap<
+    std::chrono::steady_clock::time_point,
+    std::weak_ptr<Responder>> responder_deadlines;
+  rclcpp::TimerBase::SharedPtr responder_timeout_timer;
+
+  void add_responder_deadline(const std::shared_ptr<Responder>& responder)
+  {
+    const auto deadline = std::chrono::steady_clock::now()
+      + std::chrono::duration_cast<std::chrono::steady_clock::duration>(timeout);
+    std::lock_guard<std::mutex> lock(responder_deadlines_mutex);
+    responder_deadlines.insert({deadline, responder});
+  }
+
+  void check_responder_deadlines()
+  {
+    std::vector<std::shared_ptr<Responder>> expired;
+    {
+      const auto now = std::chrono::steady_clock::now();
+      std::lock_guard<std::mutex> lock(responder_deadlines_mutex);
+      auto it = responder_deadlines.begin();
+      for (; it != responder_deadlines.end() && it->first <= now; ++it)
+      {
+        if (auto responder = it->second.lock())
+          expired.push_back(std::move(responder));
+      }
+      responder_deadlines.erase(responder_deadlines.begin(), it);
+    }
+
+    // Time out outside the lock, because forfeiting publishes messages.
+    for (const auto& responder : expired)
+      responder->timeout();
+  }
 
   using Repeat = rmf_traffic_msgs::msg::NegotiationRepeat;
   using RepeatSub = rclcpp::Subscription<Repeat>;
@@ -318,6 +348,13 @@ public:
   {
     // TODO(MXG): Make the QoS configurable
     const auto qos = rclcpp::ServicesQoS().reliable().keep_last(1000);
+
+    responder_timeout_timer = node.create_wall_timer(
+      std::chrono::milliseconds(100),
+      [this]()
+      {
+        this->check_responder_deadlines();
+      });
 
     repeat_sub = node.create_subscription<Repeat>(
       NegotiationRepeatTopicName, qos,
