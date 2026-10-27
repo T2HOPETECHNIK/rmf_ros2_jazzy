@@ -21,6 +21,8 @@
 #include <rmf_traffic/schedule/StubbornNegotiator.hpp>
 #include <rmf_traffic/agv/Planner.hpp>
 
+#include <algorithm>
+
 namespace rmf_fleet_adapter {
 namespace events {
 
@@ -224,9 +226,54 @@ auto GoToPlace::Active::make(
 
       if (self->_execution.has_value())
       {
-        if (self->_execution->uses_closed_lanes(
-            changes.closed_lanes, self->_context->itinerary()))
+        // Lanes the robot has already driven past do not affect it.
+        const auto closed_ahead = self->_execution->closed_lanes_ahead(
+          changes.closed_lanes, self->_context->itinerary());
+        if (!closed_ahead.empty())
         {
+          const auto& requesting = self->_context->requesting_mutex_groups();
+
+          // A closed lane ahead that touches a mutex group the robot is
+          // waiting for (e.g. the lane into a lift that another robot just
+          // took) means the wait itself is for a path that has closed. That
+          // mutex may not be released for a long time, so replan now in case
+          // another route, like a different lift, is open.
+          const auto& graph = self->_context->navigation_graph();
+          const bool waiting_on_closed = std::any_of(
+            closed_ahead.begin(), closed_ahead.end(),
+            [&](const std::size_t l)
+            {
+              if (l >= graph.num_lanes())
+                return false;
+
+              const auto& lane = graph.get_lane(l);
+              for (const auto* group : {
+                  &lane.properties().in_mutex_group(),
+                  &graph.get_waypoint(lane.entry().waypoint_index())
+                  .in_mutex_group(),
+                  &graph.get_waypoint(lane.exit().waypoint_index())
+                  .in_mutex_group()})
+              {
+                if (!group->empty() && requesting.count(*group) > 0)
+                  return true;
+              }
+              return false;
+            });
+
+          if (!requesting.empty() && !waiting_on_closed)
+          {
+            // The robot is holding in place until it locks a mutex group, so
+            // there is no need to replan yet. The plan is checked against the
+            // closed lanes once the mutex groups are locked.
+            RCLCPP_INFO(
+              self->_context->node()->get_logger(),
+              "Deferring replan for [%s] around a newly closed lane until it "
+              "locks the mutex groups it is waiting for",
+              self->_context->requester_id().c_str());
+            self->_context->defer_replan_until_mutex_locked();
+            return;
+          }
+
           RCLCPP_INFO(
             self->_context->node()->get_logger(),
             "Requesting replan for [%s] to avoid a newly closed lane",
@@ -475,6 +522,9 @@ void GoToPlace::Active::_find_plan()
 {
   if (_is_interrupted)
     return;
+
+  // A fresh plan accounts for any lane closures whose replan was deferred.
+  _context->take_deferred_replan();
 
   if (!_chosen_goal.has_value() && _description.prefer_same_map())
   {

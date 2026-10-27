@@ -1151,6 +1151,20 @@ RobotContext::requesting_mutex_groups() const
 }
 
 //==============================================================================
+void RobotContext::defer_replan_until_mutex_locked()
+{
+  _replan_deferred_for_mutex = true;
+}
+
+//==============================================================================
+bool RobotContext::take_deferred_replan()
+{
+  const bool deferred = _replan_deferred_for_mutex;
+  _replan_deferred_for_mutex = false;
+  return deferred;
+}
+
+//==============================================================================
 auto RobotContext::request_mutex_groups(
   std::unordered_set<std::string> groups,
   rmf_traffic::Time claim_time) -> MutexGroupRequest

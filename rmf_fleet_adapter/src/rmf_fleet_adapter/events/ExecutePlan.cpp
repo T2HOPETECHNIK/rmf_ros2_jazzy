@@ -1336,6 +1336,15 @@ bool ExecutePlan::uses_closed_lanes(
   const std::vector<std::size_t>& closed_lanes,
   const rmf_traffic::schedule::Participant& participant) const
 {
+  return !closed_lanes_ahead(closed_lanes, participant).empty();
+}
+
+//==============================================================================
+std::vector<std::size_t> ExecutePlan::closed_lanes_ahead(
+  const std::vector<std::size_t>& closed_lanes,
+  const rmf_traffic::schedule::Participant& participant) const
+{
+  std::vector<std::size_t> ahead;
   const bool matching_plan = participant.current_plan_id() == progress_plan_id;
   const auto& reached = participant.reached();
   for (const auto& wp : plan.get_waypoints())
@@ -1357,12 +1366,12 @@ bool ExecutePlan::uses_closed_lanes(
       if (std::find(closed_lanes.begin(), closed_lanes.end(), lane)
         != closed_lanes.end())
       {
-        return true;
+        ahead.push_back(lane);
       }
     }
   }
 
-  return false;
+  return ahead;
 }
 
 } // namespace events
