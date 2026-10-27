@@ -89,9 +89,12 @@ public:
 
     void kill() final;
 
+    ~Active();
+
   private:
     void _consider_going();
     void _replan();
+    void _clear_waiting();
 
     using DependencySubscription =
       rmf_traffic::schedule::ItineraryViewer::DependencySubscription;
