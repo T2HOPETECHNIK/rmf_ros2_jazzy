@@ -656,6 +656,10 @@ void GoToPlace::Active::_find_plan()
         *result, self->_description.expected_next_destinations(),
         *self->_context->planner());
 
+      // Clear the old retry first, because _execute_plan may schedule a new
+      // one (e.g. when the robot is already at its staging waypoint).
+      self->_retry_timer = nullptr;
+
       self->_execute_plan(
         self->_context->itinerary().assign_plan_id(),
         *std::move(result),
@@ -663,7 +667,6 @@ void GoToPlace::Active::_find_plan()
         goal);
 
       self->_find_path_service = nullptr;
-      self->_retry_timer = nullptr;
     });
 
   _find_path_timeout = _context->node()->try_create_wall_timer(
@@ -783,6 +786,10 @@ GoToPlace::Active::_choose_staging_goal() const
 
     --stage;
   }
+
+  // A plan cannot end inside a lift cabin, so wait outside the lift instead.
+  while (stage > 0 && graph.get_waypoint(path_wps[stage]).in_lift())
+    --stage;
 
   if (stage == 0)
     return std::nullopt;
