@@ -308,6 +308,10 @@ auto GoToPlace::Active::backup() const -> Backup
 auto GoToPlace::Active::interrupt(std::function<void()> task_is_interrupted)
 -> Resume
 {
+  RCLCPP_INFO(
+    _context->node()->get_logger(),
+    "Interrupting go_to_place for robot [%s]",
+    _context->requester_id().c_str());
   _negotiator->clear_license();
   _is_interrupted = true;
   _stop_and_clear();

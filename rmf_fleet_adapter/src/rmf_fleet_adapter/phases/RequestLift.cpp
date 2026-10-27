@@ -67,6 +67,31 @@ void RequestLift::ActivePhase::emergency_alarm(bool /*on*/)
 void RequestLift::ActivePhase::cancel()
 {
   // GoToPlace and ExecutePlan don't call the cancel function anyway
+  RCLCPP_INFO(
+    _context->node()->get_logger(),
+    "Cancel called on request for lift [%s] to [%s] for [%s] (located %s)",
+    _lift_name.c_str(),
+    _destination.c_str(),
+    _context->requester_id().c_str(),
+    _data.located == Located::Inside ? "inside" : "outside");
+}
+
+//==============================================================================
+RequestLift::ActivePhase::~ActivePhase()
+{
+  // The phase is normally dropped right after it finishes. Being dropped
+  // before that means whatever was waiting on the lift has been torn down.
+  if (!_finished)
+  {
+    RCLCPP_WARN(
+      _context->node()->get_logger(),
+      "Request for lift [%s] to [%s] for [%s] (located %s) was destroyed "
+      "before the lift arrived",
+      _lift_name.c_str(),
+      _destination.c_str(),
+      _context->requester_id().c_str(),
+      _data.located == Located::Inside ? "inside" : "outside");
+  }
 }
 
 //==============================================================================
@@ -150,6 +175,7 @@ void RequestLift::ActivePhase::_init_obs()
             "Resuming itinerary for [%s] after lift arrival",
             self->_context->requester_id().c_str());
 
+          self->_finished = true;
           LegacyTask::StatusMsg status{};
           status.state = LegacyTask::StatusMsg::STATE_COMPLETED;
           status.status = "success";
@@ -412,6 +438,18 @@ LegacyTask::StatusMsg RequestLift::ActivePhase::_get_status(
       + std::to_string(static_cast<int>(lift_state->door_state))
       + " vs " + std::to_string(static_cast<int>(LiftState::DOOR_OPEN))
       + " | " + lift_state->session_id + " vs " + _context->requester_id();
+
+    const auto now = std::chrono::steady_clock::now();
+    if (!_last_wait_log.has_value()
+      || now - *_last_wait_log > std::chrono::seconds(5))
+    {
+      _last_wait_log = now;
+      RCLCPP_INFO(
+        _context->node()->get_logger(),
+        "%s (located %s)",
+        status.status.c_str(),
+        _data.located == Located::Inside ? "inside" : "outside");
+    }
   }
 
   return status;
