@@ -15,6 +15,8 @@
  *
 */
 
+#include <algorithm>
+
 #include "internal_RobotUpdateHandle.hpp"
 #include "../TaskManager.hpp"
 
@@ -490,6 +492,26 @@ void RobotContext::filter_closed_lanes()
   const rmf_traffic::agv::LaneClosure* closures = get_lane_closures();
   if (closures)
   {
+    // If every start is on a closed lane, the robot is physically on a lane
+    // that closed underneath it. Keep the starts so it can finish driving off
+    // that lane instead of being treated as lost with no known location.
+    const bool all_closed = !_location.empty() && std::all_of(
+      _location.begin(), _location.end(),
+      [closures](const auto& l)
+      {
+        return l.lane().has_value() && closures->is_closed(*l.lane());
+      });
+
+    if (all_closed)
+    {
+      RCLCPP_WARN_THROTTLE(
+        node()->get_logger(), *node()->get_clock(), 5000,
+        "All starts for [%s] are on closed lanes. Keeping them so the robot "
+        "can leave the lane it is on.",
+        requester_id().c_str());
+      return;
+    }
+
     for (std::size_t i = 0; i < _location.size(); )
     {
       if (_location[i].lane().has_value())
