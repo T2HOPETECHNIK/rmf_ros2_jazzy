@@ -899,6 +899,14 @@ void GoToPlace::Active::_execute_plan(
             self->_execution = std::nullopt;
             self->_chosen_goal = std::nullopt;
             self->_staging = false;
+
+            // The staging execution shares this event's state and marked it
+            // completed, but the event is still waiting for its real goal.
+            self->_state->update_status(Status::Underway);
+            self->_state->update_log().info(
+              "Reached the staging waypoint. Waiting for a path to the goal.");
+            self->_update();
+
             self->_find_plan();
           });
       };
