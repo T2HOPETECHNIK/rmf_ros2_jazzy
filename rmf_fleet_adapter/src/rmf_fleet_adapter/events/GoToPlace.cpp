@@ -773,9 +773,15 @@ GoToPlace::Active::_choose_staging_goal() const
   if (!blocked.has_value())
     return std::nullopt;
 
+  std::size_t stage = *blocked;
+
+  // A plan cannot end inside a lift cabin, so wait outside the lift instead.
+  // Do this first so the mutex group below is the one outside the cabin.
+  while (stage > 0 && graph.get_waypoint(path_wps[stage]).in_lift())
+    --stage;
+
   // Stop before entering the mutex group of the waypoint in front of the
   // closed lane, e.g. outside the lift lobby, so the robot does not block it.
-  std::size_t stage = *blocked;
   const auto& group = graph.get_waypoint(path_wps[stage]).in_mutex_group();
   if (!group.empty())
   {
@@ -791,11 +797,9 @@ GoToPlace::Active::_choose_staging_goal() const
     --stage;
   }
 
-  // A plan cannot end inside a lift cabin, so wait outside the lift instead.
-  while (stage > 0 && graph.get_waypoint(path_wps[stage]).in_lift())
-    --stage;
-
-  if (stage == 0)
+  // Backing out of the group can land in a cabin the path rode earlier. Do not
+  // stage there, and do not back into another group either.
+  if (stage == 0 || graph.get_waypoint(path_wps[stage]).in_lift())
     return std::nullopt;
 
   return rmf_traffic::agv::Plan::Goal(path_wps[stage]);
