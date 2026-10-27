@@ -580,6 +580,10 @@ void GoToPlace::Active::_find_plan()
       }
       retain.erase("");
       _context->retain_mutex_groups(retain);
+
+      // A replan can get here with the previous (now stopped) execution still
+      // set, and the retry does nothing while an execution exists.
+      _execution = std::nullopt;
       _schedule_retry();
       return;
     }
