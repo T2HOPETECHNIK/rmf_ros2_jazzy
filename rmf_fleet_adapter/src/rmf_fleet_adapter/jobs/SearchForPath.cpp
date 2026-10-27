@@ -37,7 +37,7 @@ std::function<bool()> make_interrupter(
           return true;
 
         const auto now = std::chrono::steady_clock::now();
-        if (deadline <= now)
+        if (deadline.has_value() && *deadline <= now)
           return true;
       }
 
