@@ -66,6 +66,8 @@ struct RequestLift
 
     const std::string& description() const override;
 
+    ~ActivePhase();
+
   private:
 
     agv::RobotContextPtr _context;
@@ -91,6 +93,7 @@ struct RequestLift
     std::shared_ptr<WatchdogInfo> _watchdog_info;
     rclcpp::TimerBase::SharedPtr _rewait_timer;
     bool _rewaiting = false;
+    std::optional<std::chrono::steady_clock::time_point> _last_wait_log;
 
     ActivePhase(
       agv::RobotContextPtr context,
