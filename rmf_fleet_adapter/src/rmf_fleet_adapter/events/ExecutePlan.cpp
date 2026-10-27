@@ -666,6 +666,35 @@ public:
 };
 
 //==============================================================================
+class LiftSessionTracker : public rmf_traffic::agv::Graph::Lane::Executor
+{
+public:
+  std::optional<std::string>& session_lift;
+
+  LiftSessionTracker(std::optional<std::string>& session_lift_)
+  : session_lift(session_lift_)
+  {
+    // Do nothing
+  }
+
+  void execute(const Dock&) final {}
+  void execute(const Wait&) final {}
+  void execute(const DoorOpen&) final {}
+  void execute(const DoorClose&) final {}
+  void execute(const LiftSessionBegin& e) final
+  {
+    session_lift = e.lift_name();
+  }
+  void execute(const LiftMove&) final {}
+  void execute(const LiftDoorOpen&) final {}
+  void execute(const LiftSessionEnd& e) final
+  {
+    if (session_lift == e.lift_name())
+      session_lift = std::nullopt;
+  }
+};
+
+//==============================================================================
 std::optional<ExecutePlan> ExecutePlan::make(
   agv::RobotContextPtr context,
   rmf_traffic::PlanId recommended_plan_id,
@@ -859,6 +888,58 @@ std::optional<ExecutePlan> ExecutePlan::make(
   std::vector<rmf_traffic::agv::Plan::Waypoint> waypoints =
     plan.get_waypoints();
 
+  // The lift whose session the plan has begun so far. A plan that starts inside
+  // a lift is already in that lift's session, and so is one that already
+  // summons a lift after a replan.
+  std::optional<std::string> session_lift;
+  for (const auto& legacy : legacy_phases)
+  {
+    if (const auto* request =
+      dynamic_cast<const RequestLift*>(legacy.phase.get()))
+    {
+      session_lift = request->lift_name();
+    }
+  }
+
+  if (!session_lift.has_value())
+  {
+    const Eigen::Vector2d p0 =
+      waypoints.front().position().block<2, 1>(0, 0);
+    for (const auto& lift : graph.all_known_lifts())
+    {
+      if (lift->is_in_lift(p0, envelope))
+      {
+        session_lift = lift->name();
+        break;
+      }
+    }
+  }
+
+  // The planner can produce a plan that moves into a lift cabin without a
+  // LiftSessionBegin event (seen when a tiny rotation is needed at the lift
+  // entry waypoint). Without a session the lift is never summoned, so the
+  // robot would drive into the shaft. Returns the lift that needs a session
+  // before moving to wp, if any.
+  const auto lift_missing_session = [&](
+    const rmf_traffic::agv::Plan::Waypoint& wp,
+    const std::vector<rmf_traffic::agv::Plan::Waypoint>& previous)
+    -> rmf_traffic::agv::Graph::LiftPropertiesPtr
+    {
+      if (!wp.graph_index().has_value() || previous.empty())
+        return nullptr;
+
+      const auto lift = graph.get_waypoint(*wp.graph_index()).in_lift();
+      if (!lift || session_lift == lift->name())
+        return nullptr;
+
+      const Eigen::Vector2d p_prev =
+        previous.back().position().block<2, 1>(0, 0);
+      if (lift->is_in_lift(p_prev, envelope))
+        return nullptr;
+
+      return lift;
+    };
+
   std::vector<rmf_traffic::agv::Plan::Waypoint> move_through;
   std::optional<LockMutexGroup::Data> current_mutex_groups;
   std::unordered_set<std::string> remaining_mutex_groups;
@@ -1035,6 +1116,61 @@ std::optional<ExecutePlan> ExecutePlan::make(
         }
       }
 
+      if (const auto lift = lift_missing_session(*it, move_through))
+      {
+        const auto hold = move_through.back();
+        const auto& floor =
+          graph.get_waypoint(*it->graph_index()).get_map_name();
+        RCLCPP_WARN(
+          context->node()->get_logger(),
+          "Plan for [%s] moves into lift [%s] on floor [%s] without starting a "
+          "lift session. Adding a request for the lift before entering it.",
+          context->requester_id().c_str(),
+          lift->name().c_str(),
+          floor.c_str());
+
+        if (move_through.size() > 1)
+        {
+          legacy_phases.emplace_back(
+            std::make_shared<phases::MoveRobot::PendingPhase>(
+              context, move_through, plan_id, tail_period),
+            hold.time(), hold.dependencies(), current_mutex_groups);
+        }
+        else if (current_mutex_groups.has_value())
+        {
+          legacy_phases.emplace_back(
+            nullptr, hold.time(),
+            rmf_traffic::Dependencies(), current_mutex_groups);
+        }
+        current_mutex_groups = std::nullopt;
+
+        truncate_arrival(*previous_itinerary, hold);
+        previous_itinerary =
+          std::make_shared<rmf_traffic::schedule::Itinerary>(full_itinerary);
+
+        legacy_phases.emplace_back(
+          std::make_shared<phases::RequestLift::PendingPhase>(
+            context,
+            lift->name(),
+            floor,
+            phases::RequestLift::Data{
+              hold.time(),
+              phases::RequestLift::Located::Outside,
+              plan_id,
+              std::nullopt,
+              previous_itinerary,
+              hold
+            }),
+          hold.time(), rmf_traffic::Dependencies(), std::nullopt);
+
+        session_lift = lift->name();
+        move_through.clear();
+        move_through.push_back(hold);
+        waypoints.erase(waypoints.begin(), it);
+        event_occurred = true;
+        break;
+      }
+
       move_through.push_back(*it);
       const bool release_lift_here = release_lift &&
         it->graph_index().has_value() &&
@@ -1101,6 +1237,8 @@ std::optional<ExecutePlan> ExecutePlan::make(
             previous_itinerary, full_itinerary,
             continuous);
 
+          LiftSessionTracker tracker(session_lift);
+          it->event()->execute(tracker);
           it->event()->execute(factory);
           while (factory.moving_lift())
           {
@@ -1133,6 +1271,7 @@ std::optional<ExecutePlan> ExecutePlan::make(
             }
 
             factory.initial_waypoint = *it;
+            it->event()->execute(tracker);
             it->event()->execute(factory);
           }
         }
