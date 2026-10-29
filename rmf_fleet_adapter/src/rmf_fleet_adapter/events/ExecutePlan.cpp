@@ -813,7 +813,7 @@ std::optional<ExecutePlan> ExecutePlan::make(
       // Check if the robot is going into a lift and summon the lift
       for (const auto& lift : graph.all_known_lifts())
       {
-        if (lift->is_in_lift(p1, envelope))
+        if (wp.in_lift() == lift && lift->is_in_lift(p1, envelope))
         {
           auto side = phases::RequestLift::Located::Outside;
           if (lift->is_in_lift(p0, envelope))
