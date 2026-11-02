@@ -134,10 +134,12 @@ bool dependency_pending(
 
     if (!reached || route >= reached->size())
       return true;
-
-    // Keys are the target's checkpoints that the dependent waits for
-    if (checkpoints.rbegin()->first > (*reached)[route])
-      return true;
+    
+    for (const auto& [dependent_checkpoint, on_checkpoint] : checkpoints)
+    {
+      if (on_checkpoint > (*reached)[route])
+        return true;
+    }
   }
 
   return false;
