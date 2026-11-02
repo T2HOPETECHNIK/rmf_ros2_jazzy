@@ -1473,21 +1473,59 @@ std::optional<ExecutePlan> ExecutePlan::make(
 //==============================================================================
 bool ExecutePlan::uses_closed_lanes(
   const std::vector<std::size_t>& closed_lanes,
-  const rmf_traffic::schedule::Participant& participant) const
+  const rmf_traffic::schedule::Participant& participant,
+  const rmf_traffic::agv::Plan::StartSet& location) const
 {
-  return !closed_lanes_ahead(closed_lanes, participant).empty();
+  return !closed_lanes_ahead(closed_lanes, participant, location).empty();
 }
 
 //==============================================================================
 std::vector<std::size_t> ExecutePlan::closed_lanes_ahead(
   const std::vector<std::size_t>& closed_lanes,
-  const rmf_traffic::schedule::Participant& participant) const
+  const rmf_traffic::schedule::Participant& participant,
+  const rmf_traffic::agv::Plan::StartSet& location) const
 {
   std::vector<std::size_t> ahead;
   const bool matching_plan = participant.current_plan_id() == progress_plan_id;
   const auto& reached = participant.reached();
-  for (const auto& wp : plan.get_waypoints())
+
+  // Waypoints the robot is sitting exactly on. Its arrival there may not be
+  // reported yet, e.g. while it waits at a lift entrance for the lift, but
+  // the lanes leading into it are behind it.
+  std::unordered_set<std::size_t> on_waypoints;
+  for (const auto& l : location)
   {
+    if (!l.lane().has_value() && !l.location().has_value())
+      on_waypoints.insert(l.waypoint());
+  }
+
+  // The robot has driven everything up to the first plan waypoint at its spot
+  // (and any directly following waypoints there, e.g. in-place turns). If the
+  // plan comes back to the same waypoint later, those lanes are still ahead.
+  const auto& waypoints = plan.get_waypoints();
+  std::size_t driven = 0;
+  if (!on_waypoints.empty())
+  {
+    const auto here = [&](const rmf_traffic::agv::Plan::Waypoint& wp)
+      {
+        return wp.graph_index().has_value()
+          && on_waypoints.count(*wp.graph_index()) > 0;
+      };
+
+    const auto first = std::find_if(waypoints.begin(), waypoints.end(), here);
+    if (first != waypoints.end())
+    {
+      auto it = first;
+      while (it != waypoints.end() && here(*it))
+        ++it;
+      driven = static_cast<std::size_t>(it - waypoints.begin());
+    }
+  }
+
+  for (std::size_t i = driven; i < waypoints.size(); ++i)
+  {
+    const auto& wp = waypoints[i];
+
     const auto& arrivals = wp.arrival_checkpoints();
     const bool arrived = matching_plan && !arrivals.empty()
       && std::all_of(arrivals.begin(), arrivals.end(),

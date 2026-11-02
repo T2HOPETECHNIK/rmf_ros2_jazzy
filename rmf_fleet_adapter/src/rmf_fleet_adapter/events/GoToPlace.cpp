@@ -230,7 +230,8 @@ auto GoToPlace::Active::make(
       {
         // Lanes the robot has already driven past do not affect it.
         const auto closed_ahead = self->_execution->closed_lanes_ahead(
-          changes.closed_lanes, self->_context->itinerary());
+          changes.closed_lanes, self->_context->itinerary(),
+          self->_context->location());
         if (!closed_ahead.empty())
         {
           const auto& requesting = self->_context->requesting_mutex_groups();
