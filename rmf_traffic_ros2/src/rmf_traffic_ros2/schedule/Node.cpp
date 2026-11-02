@@ -104,12 +104,50 @@ bool inside_cabin(
 }
 
 //==============================================================================
+// True if a dependency on the target participant still holds the dependent
+// back. Itineraries keep their dependencies after they are satisfied, e.g. a
+// robot that waited in a lift lobby and then parked at a charger. 
+bool dependency_pending(
+  const rmf_traffic::DependsOnPlan& dep,
+  const rmf_traffic::ParticipantId target,
+  const rmf_traffic::schedule::ItineraryViewer& viewer)
+{
+  const auto dep_plan = dep.plan();
+  if (!dep_plan.has_value())
+    return false;
+
+  const auto current_plan = viewer.get_current_plan_id(target);
+  if (!current_plan.has_value())
+    return true;
+
+  if (rmf_utils::modular(*dep_plan).less_than(*current_plan))
+    return false;
+
+  if (*dep_plan != *current_plan)
+    return true;
+
+  const auto* reached = viewer.get_current_progress(target);
+  for (const auto& [route, checkpoints] : dep.routes())
+  {
+    if (checkpoints.empty())
+      continue;
+
+    if (!reached || route >= reached->size())
+      return true;
+    
+    for (const auto& [dependent_checkpoint, on_checkpoint] : checkpoints)
+    {
+      if (on_checkpoint > (*reached)[route])
+        return true;
+    }
+  }
+
+  return false;
+}
+
+//==============================================================================
 // True if the participant is currently inside a lift cabin, either riding or
-// waiting for the doors. It cannot yield from there, so negotiating would only
-// end in a forfeit. A ride can take longer than planned, leaving no route that
-// covers the current time, so fall back to where the latest route ended, but
-// only for overrun_limit after it ended, in case the robot has since left the
-// cabin or stopped reporting. Past that its conflicts are negotiated normally.
+// waiting for the doors.
 bool riding_lift(
   const rmf_traffic::schedule::ItineraryView& itinerary,
   const ConflictFilter& filter)
@@ -275,10 +313,7 @@ ConflictKind classify_route_pair(
     return ConflictKind::None;
 
   // Ignore conflicts where either participant is inside a lift cabin at the
-  // time of the conflict, e.g. against a robot at the lift door, or on another
-  // floor since a ride is scheduled on both maps. The robot in the cabin
-  // cannot yield, so negotiating would only end in a forfeit. Conflicts where
-  // both are outside a cabin, such as after the ride, are kept.
+  // time of the conflict.
   if (in_cabin_at(route_a, found_conflict->time, filter)
     || in_cabin_at(route_b, found_conflict->time, filter))
     return ConflictKind::None;
@@ -1130,7 +1165,7 @@ ScheduleNode::insert_conflicts(
         {
           const auto d_it = r->dependencies().find(check);
           const bool include = d_it != r->dependencies().end()
-          && d_it->second.plan().has_value();
+          && dependency_pending(d_it->second, check, mirror);
 
           if (include)
           {
