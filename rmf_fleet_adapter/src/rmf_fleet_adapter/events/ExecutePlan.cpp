@@ -18,6 +18,8 @@
 #include "ExecutePlan.hpp"
 
 #include <algorithm>
+#include <optional>
+#include <unordered_map>
 #include "LegacyPhaseShim.hpp"
 #include "WaitForTraffic.hpp"
 #include "WaitUntil.hpp"
@@ -1474,29 +1476,35 @@ std::optional<ExecutePlan> ExecutePlan::make(
 bool ExecutePlan::uses_closed_lanes(
   const std::vector<std::size_t>& closed_lanes,
   const rmf_traffic::schedule::Participant& participant,
-  const rmf_traffic::agv::Plan::StartSet& location) const
+  const rmf_traffic::agv::Plan::StartSet& location,
+  const double max_merge_waypoint_distance) const
 {
-  return !closed_lanes_ahead(closed_lanes, participant, location).empty();
+  return !closed_lanes_ahead(
+    closed_lanes, participant, location, max_merge_waypoint_distance).empty();
 }
 
 //==============================================================================
 std::vector<std::size_t> ExecutePlan::closed_lanes_ahead(
   const std::vector<std::size_t>& closed_lanes,
   const rmf_traffic::schedule::Participant& participant,
-  const rmf_traffic::agv::Plan::StartSet& location) const
+  const rmf_traffic::agv::Plan::StartSet& location,
+  const double max_merge_waypoint_distance) const
 {
   std::vector<std::size_t> ahead;
   const bool matching_plan = participant.current_plan_id() == progress_plan_id;
   const auto& reached = participant.reached();
 
-  // Waypoints the robot is sitting exactly on. Its arrival there may not be
-  // reported yet, e.g. while it waits at a lift entrance for the lift, but
-  // the lanes leading into it are behind it.
-  std::unordered_set<std::size_t> on_waypoints;
+  // Waypoints the robot is sitting on. Its arrival there may not be reported
+  // yet, e.g. while it waits at a lift entrance for the lift, but the lanes
+  // leading into it are behind it. A start without a lane is on its waypoint
+  // if it has no position, or (as EasyFullControl reports it) its position is
+  // within the merge distance of the waypoint. Starts further away still need
+  // an approach, so their incoming lanes stay ahead.
+  std::unordered_map<std::size_t, std::optional<Eigen::Vector2d>> on_waypoints;
   for (const auto& l : location)
   {
-    if (!l.lane().has_value() && !l.location().has_value())
-      on_waypoints.insert(l.waypoint());
+    if (!l.lane().has_value())
+      on_waypoints.insert({l.waypoint(), l.location()});
   }
 
   // The robot has driven everything up to the first plan waypoint at its spot
@@ -1508,8 +1516,18 @@ std::vector<std::size_t> ExecutePlan::closed_lanes_ahead(
   {
     const auto here = [&](const rmf_traffic::agv::Plan::Waypoint& wp)
       {
-        return wp.graph_index().has_value()
-          && on_waypoints.count(*wp.graph_index()) > 0;
+        if (!wp.graph_index().has_value())
+          return false;
+
+        const auto it = on_waypoints.find(*wp.graph_index());
+        if (it == on_waypoints.end())
+          return false;
+
+        if (!it->second.has_value())
+          return true;
+
+        const Eigen::Vector2d p_wp = wp.position().block<2, 1>(0, 0);
+        return (*it->second - p_wp).norm() <= max_merge_waypoint_distance;
       };
 
     const auto first = std::find_if(waypoints.begin(), waypoints.end(), here);

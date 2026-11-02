@@ -229,9 +229,12 @@ auto GoToPlace::Active::make(
       if (self->_execution.has_value())
       {
         // Lanes the robot has already driven past do not affect it.
+        const auto nav_params = self->_context->nav_params();
+        const double merge_distance = nav_params ?
+          nav_params->max_merge_waypoint_distance : 1e-3;
         const auto closed_ahead = self->_execution->closed_lanes_ahead(
           changes.closed_lanes, self->_context->itinerary(),
-          self->_context->location());
+          self->_context->location(), merge_distance);
         if (!closed_ahead.empty())
         {
           const auto& requesting = self->_context->requesting_mutex_groups();
