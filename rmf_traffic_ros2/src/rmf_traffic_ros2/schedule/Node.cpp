@@ -257,6 +257,33 @@ std::size_t waypoints_until(
 }
 
 //==============================================================================
+std::optional<rmf_traffic::Trajectory> trajectory_from(
+  const rmf_traffic::Trajectory& trajectory,
+  const rmf_traffic::Time time)
+{
+  const auto* start = trajectory.start_time();
+  const auto* finish = trajectory.finish_time();
+  if (!start || !finish || *finish <= time)
+    return std::nullopt;
+
+  if (time <= *start || trajectory.size() < 2)
+    return trajectory;
+
+  const auto motion = rmf_traffic::Motion::compute_cubic_splines(trajectory);
+  rmf_traffic::Trajectory cropped;
+  cropped.insert(
+    time, motion->compute_position(time), motion->compute_velocity(time));
+
+  for (auto it = trajectory.lower_bound(time); it != trajectory.end(); ++it)
+  {
+    if (it->time() > time)
+      cropped.insert(*it);
+  }
+
+  return cropped;
+}
+
+//==============================================================================
 enum class ConflictKind
 {
   None,
@@ -305,12 +332,37 @@ ConflictKind classify_route_pair(
   if (route_a.check_dependencies(b, plan_b, r_b))
     return ConflictKind::None;
 
-  const auto found_conflict = rmf_traffic::DetectConflict::between(
-    desc_b.profile(), route_b.trajectory(), nullptr,
-    desc_a.profile(), route_a.trajectory(), nullptr);
+  const rmf_traffic::Trajectory* traj_a = &route_a.trajectory();
+  const rmf_traffic::Trajectory* traj_b = &route_b.trajectory();
+  auto found_conflict = rmf_traffic::DetectConflict::between(
+    desc_b.profile(), *traj_b, nullptr,
+    desc_a.profile(), *traj_a, nullptr);
 
   if (!found_conflict.has_value())
     return ConflictKind::None;
+
+  // A conflict that is already in the past is stale schedule data (e.g. a
+  // robot that has already passed a door but whose itinerary still holds the
+  // door segment, shifted by delays). Only what lies ahead of now matters, so
+  // check again using only the remaining part of each trajectory.
+  std::optional<rmf_traffic::Trajectory> future_a;
+  std::optional<rmf_traffic::Trajectory> future_b;
+  if (found_conflict->time < filter.now)
+  {
+    future_a = trajectory_from(*traj_a, filter.now);
+    future_b = trajectory_from(*traj_b, filter.now);
+    if (!future_a.has_value() || !future_b.has_value())
+      return ConflictKind::None;
+
+    traj_a = &*future_a;
+    traj_b = &*future_b;
+    found_conflict = rmf_traffic::DetectConflict::between(
+      desc_b.profile(), *traj_b, nullptr,
+      desc_a.profile(), *traj_a, nullptr);
+
+    if (!found_conflict.has_value())
+      return ConflictKind::None;
+  }
 
   // Ignore conflicts where either participant is inside a lift cabin at the
   // time of the conflict.
@@ -327,9 +379,9 @@ ConflictKind classify_route_pair(
     {
       // DetectConflict was given route_b first, so a_it belongs to route_b.
       const auto free_b = waypoints_until(
-        route_b.trajectory(), found_conflict->a_it, filter.now);
+        *traj_b, found_conflict->a_it, filter.now);
       const auto free_a = waypoints_until(
-        route_a.trajectory(), found_conflict->b_it, filter.now);
+        *traj_a, found_conflict->b_it, filter.now);
 
       if (free_a > filter.min_free_waypoints
         && free_b > filter.min_free_waypoints)
