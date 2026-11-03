@@ -2607,3 +2607,42 @@ SCENARIO("fan-in-fan-out bottleneck", "[.high_cpu]")
   }
 }
 
+
+
+TEST_CASE(
+  "Planning jobs retain admission ownership without retaining it in plans",
+  "[admission_lifetime]")
+{
+  rmf_traffic::agv::Graph graph;
+  graph.add_waypoint("L1", {0.0, 0.0});
+  graph.add_waypoint("L1", {1.0, 0.0});
+  graph.add_lane(0, 1);
+  const rmf_traffic::Profile profile{
+    rmf_traffic::geometry::make_final_convex<rmf_traffic::geometry::Circle>(
+      0.5)};
+  const rmf_traffic::agv::VehicleTraits traits{
+    {0.7, 0.3}, {1.0, 0.45}, profile};
+  const auto planner = std::make_shared<rmf_traffic::agv::Planner>(
+    rmf_traffic::agv::Planner::Configuration{graph, traits},
+    rmf_traffic::agv::Planner::Options{nullptr});
+  auto guard = std::make_shared<int>(0);
+  std::weak_ptr<int> weak_guard = guard;
+  auto job = std::make_shared<rmf_fleet_adapter::jobs::Planning>(
+    planner,
+    rmf_traffic::agv::Plan::StartSet{
+      {std::chrono::steady_clock::now(), 0, 0.0}},
+    rmf_traffic::agv::Plan::Goal(1),
+    rmf_traffic::agv::Plan::Options{nullptr}, guard);
+  guard.reset();
+  REQUIRE_FALSE(weak_guard.expired());
+  // A search can outlive the service while an asynchronous worker holds it.
+  auto worker_reference = job;
+  job.reset();
+  REQUIRE_FALSE(weak_guard.expired());
+  // Retaining a result for approval must not occupy the planning slot forever.
+  auto retained_result = worker_reference->progress();
+  worker_reference.reset();
+  REQUIRE(weak_guard.expired());
+  retained_result.resume();
+  CHECK(retained_result.success());
+}

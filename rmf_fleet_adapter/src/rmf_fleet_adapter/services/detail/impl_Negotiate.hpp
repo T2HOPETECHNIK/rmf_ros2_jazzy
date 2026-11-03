@@ -53,7 +53,7 @@ void Negotiate::operator()(const Subscriber& s)
       auto job = std::make_shared<jobs::Planning>(
         _planner, _starts, goal,
         rmf_traffic::agv::Plan::Options(validator)
-        .interrupter(interrupter));
+        .interrupter(interrupter), _responder);
 
       _evaluator.initialize(job->progress());
 

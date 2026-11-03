@@ -16,6 +16,8 @@
 */
 
 #include "NegotiationRoom.hpp"
+#include "ResponseAdmission.hpp"
+#include <atomic>
 
 #include <rmf_traffic_ros2/Route.hpp>
 #include <rmf_traffic_ros2/schedule/Itinerary.hpp>
@@ -64,6 +66,23 @@ std::string ptr_to_string(T* ptr)
 class Negotiation::Implementation
 {
 public:
+  using Admission = detail::ResponseAdmission;
+  // Protect protocol state shared by ROS callbacks and asynchronous responders.
+  // Queued work may outlive this implementation, so it checks owner under lock.
+  struct Context
+  {
+    std::recursive_mutex mutex;
+    Implementation* owner = nullptr;
+  };
+  std::shared_ptr<Context> context = std::make_shared<Context>();
+  std::shared_ptr<Admission> admission;
+  rclcpp::TimerBase::SharedPtr admission_timer;
+
+  ~Implementation()
+  {
+    std::lock_guard<std::recursive_mutex> lock(context->mutex);
+    context->owner = nullptr;
+  }
 
   class Responder : public rmf_traffic::schedule::Negotiator::Responder
   {
@@ -72,8 +91,13 @@ public:
     Responder(
       Implementation* const impl_,
       const rmf_traffic::schedule::Version version_,
-      rmf_traffic::schedule::Negotiation::TablePtr table_)
-    : impl(impl_),
+      rmf_traffic::schedule::Negotiation::TablePtr table_,
+      Admission::Lease lease_ = nullptr,
+      std::optional<Admission::Clock::time_point> deadline_ = std::nullopt)
+    : deadline(deadline_.value_or(Admission::Clock::now() + impl_->timeout)),
+      impl(impl_),
+      context(impl_->context),
+      lease(std::move(lease_)),
       conflict_version(version_),
       table(table_),
       table_version(table->version()),
@@ -101,9 +125,15 @@ public:
       std::vector<rmf_traffic::Route> itinerary,
       std::function<UpdateVersion()> approval_callback) const final
     {
-      responded = true;
-      if (table->defunct())
+      std::lock_guard<std::recursive_mutex> lock(context->mutex);
+      if (responded || !current())
         return;
+      if (Admission::Clock::now() >= deadline)
+      {
+        forfeit({});
+        return;
+      }
+      responded = true;
 
       if (table->submit(plan_id, itinerary, table_version+1))
       {
@@ -114,7 +144,7 @@ public:
 
         impl->publish_proposal(conflict_version, *table);
 
-        if (impl->worker)
+        if (impl->worker || impl->admission)
         {
           for (const auto& c : table->children())
           {
@@ -122,13 +152,7 @@ public:
             if (n_it == impl->negotiators->end())
               continue;
 
-            impl->worker->schedule(
-              [viewer = c->viewer(),
-              negotiator = n_it->second.get(),
-              responder = make(impl, conflict_version, c)]()
-              {
-                negotiator->respond(viewer, responder);
-              });
+            impl->request_response(c, conflict_version, true);
           }
         }
       }
@@ -136,6 +160,14 @@ public:
 
     void reject(const Alternatives& alternatives) const final
     {
+      std::lock_guard<std::recursive_mutex> lock(context->mutex);
+      if (responded || !current())
+        return;
+      if (Admission::Clock::now() >= deadline)
+      {
+        forfeit({});
+        return;
+      }
       responded = true;
       if (parent && !parent->defunct())
       {
@@ -169,6 +201,9 @@ public:
 
     void forfeit(const std::vector<ParticipantId>& /*blockers*/) const final
     {
+      std::lock_guard<std::recursive_mutex> lock(context->mutex);
+      if (responded || !current())
+        return;
       responded = true;
       if (!table->defunct())
       {
@@ -181,8 +216,7 @@ public:
 
     void timeout()
     {
-      if (!responded)
-        forfeit({});
+      forfeit({});
     }
 
     ~Responder()
@@ -190,9 +224,19 @@ public:
       timeout();
     }
 
+    const Admission::Clock::time_point deadline;
+
   private:
 
+    bool current() const
+    {
+      return context->owner && impl->negotiations.count(conflict_version)
+        && !table->defunct() && table->version() == table_version;
+    }
+
     Implementation* const impl;
+    const std::shared_ptr<Context> context;
+    const Admission::Lease lease;
     const rmf_traffic::schedule::Version conflict_version;
 
     const rmf_traffic::schedule::Negotiation::TablePtr table;
@@ -219,10 +263,10 @@ public:
 
   void add_responder_deadline(const std::shared_ptr<Responder>& responder)
   {
-    const auto deadline = std::chrono::steady_clock::now()
-      + std::chrono::duration_cast<std::chrono::steady_clock::duration>(timeout);
+    // Admission may have spent part of the response budget in the queue.
+    // The shared timer must enforce that original absolute deadline.
     std::lock_guard<std::mutex> lock(responder_deadlines_mutex);
-    responder_deadlines.insert({deadline, responder});
+    responder_deadlines.insert({responder->deadline, responder});
   }
 
   void check_responder_deadlines()
@@ -346,6 +390,7 @@ public:
     negotiators(std::make_shared<NegotiatorMap>()),
     failure_callbacks(std::make_shared<FailureMap>())
   {
+    context->owner = this;
     // TODO(MXG): Make the QoS configurable
     const auto qos = rclcpp::ServicesQoS().reliable().keep_last(1000);
 
@@ -360,6 +405,7 @@ public:
       NegotiationRepeatTopicName, qos,
       [&](const Repeat::UniquePtr msg)
       {
+        std::lock_guard<std::recursive_mutex> lock(context->mutex);
         this->receive_repeat_request(*msg);
       });
 
@@ -370,6 +416,7 @@ public:
       NegotiationNoticeTopicName, qos,
       [&](const Notice::UniquePtr msg)
       {
+        std::lock_guard<std::recursive_mutex> lock(context->mutex);
         this->receive_notice(*msg);
       });
 
@@ -383,6 +430,7 @@ public:
       NegotiationProposalTopicName, qos,
       [&](const Proposal::UniquePtr msg)
       {
+        std::lock_guard<std::recursive_mutex> lock(context->mutex);
         this->receive_proposal(*msg);
       });
 
@@ -393,6 +441,7 @@ public:
       NegotiationRejectionTopicName, qos,
       [&](const Rejection::UniquePtr msg)
       {
+        std::lock_guard<std::recursive_mutex> lock(context->mutex);
         this->receive_rejection(*msg);
       });
 
@@ -403,6 +452,7 @@ public:
       NegotiationForfeitTopicName, qos,
       [&](const Forfeit::UniquePtr msg)
       {
+        std::lock_guard<std::recursive_mutex> lock(context->mutex);
         this->receive_forfeit(*msg);
       });
 
@@ -413,6 +463,7 @@ public:
       NegotiationConclusionTopicName, qos,
       [&](const Conclusion::UniquePtr msg)
       {
+        std::lock_guard<std::recursive_mutex> lock(context->mutex);
         this->receive_conclusion(*msg);
       });
 
@@ -462,6 +513,98 @@ public:
     publish_proposal(msg.conflict_version, *table);
   }
 
+  void set_response_limits(std::size_t active, std::size_t queued)
+  {
+    std::lock_guard<std::recursive_mutex> lock(context->mutex);
+    if (admission || !negotiations.empty())
+      throw std::logic_error("Set negotiation limits once, before use");
+    admission = std::make_shared<Admission>(active, queued);
+    auto scheduled = std::make_shared<std::atomic<bool>>(false);
+    admission_timer = node.create_wall_timer(std::chrono::milliseconds(20),
+        [queue = std::weak_ptr<Admission>(admission), worker = worker,
+        scheduled]
+        {
+          const auto pending = queue.lock();
+          if (!pending || !pending->has_pending() || scheduled->exchange(true))
+            return;
+          auto drain = [queue, scheduled]
+        {
+          // Clear the flag even when a negotiator throws.
+          struct Reset
+          {
+            std::shared_ptr<std::atomic<bool>> flag;
+            ~Reset() { *flag = false; }
+          } reset{scheduled};
+          if (auto q = queue.lock())
+            q->drain();
+        };
+          if (worker)
+            worker->schedule(std::move(drain));
+          else
+            drain();
+        });
+  }
+
+  void request_response(
+    const TablePtr& table, Version conflict_version, bool asynchronous = false)
+  {
+    if (!admission)
+    {
+      auto respond = [ctx = context, table,
+          responder = Responder::make(this, conflict_version, table)]
+      {
+        std::lock_guard<std::recursive_mutex> lock(ctx->mutex);
+        if (!ctx->owner || table->defunct())
+          return;
+        const auto n_it = ctx->owner->negotiators->find(table->participant());
+        if (n_it != ctx->owner->negotiators->end())
+          n_it->second->respond(table->viewer(), responder);
+      };
+      if (asynchronous && worker)
+        worker->schedule(std::move(respond));
+      else
+        respond();
+      return;
+    }
+
+    const auto version = table->version();
+    const auto valid = [ctx = context, table, conflict_version, version]
+    {
+      std::lock_guard<std::recursive_mutex> lock(ctx->mutex);
+      return ctx->owner && ctx->owner->negotiations.count(conflict_version)
+        && ctx->owner->negotiators->count(table->participant())
+        && !table->defunct() && table->version() == version
+        && !table->submission() && !table->forfeited();
+    };
+    auto expire = [ctx = context, table, conflict_version, version, valid]
+    {
+      std::lock_guard<std::recursive_mutex> lock(ctx->mutex);
+      if (valid())
+      {
+        table->forfeit(version);
+        ctx->owner->publish_forfeit(conflict_version, *table);
+      }
+    };
+    admission->enqueue({
+        {conflict_version, reinterpret_cast<uintptr_t>(table.get()), version},
+        Admission::Clock::now() + timeout, valid,
+        [ctx = context, table, conflict_version, valid, expire](
+          Admission::Lease lease, Admission::Clock::time_point deadline)
+        {
+          std::lock_guard<std::recursive_mutex> lock(ctx->mutex);
+          if (!valid())
+            return;
+          if (Admission::Clock::now() >= deadline)
+          {
+            expire();
+            return;
+          }
+          const auto n_it = ctx->owner->negotiators->find(table->participant());
+          n_it->second->respond(table->viewer(), Responder::make(
+            ctx->owner, conflict_version, table, std::move(lease), deadline));
+        }, std::move(expire)});
+  }
+
   void respond_to_queue(
     std::vector<TablePtr> queue,
     Version conflict_version)
@@ -489,9 +632,7 @@ public:
           continue;
         }
 
-        const auto& negotiator = n_it->second;
-        negotiator->respond(
-          top->viewer(), Responder::make(this, conflict_version, top));
+        request_response(top, conflict_version);
       }
 
       if (top->submission())
@@ -1018,20 +1159,24 @@ public:
     Handle(
       const ParticipantId for_participant_,
       NegotiatorMapPtr negotiators,
-      FailureMapPtr failure)
-    : for_participant(for_participant_),
+      FailureMapPtr failure,
+      std::shared_ptr<Context> context_)
+    : context(std::move(context_)),
+      for_participant(for_participant_),
       weak_negotiator_map(negotiators),
       weak_failure_map(failure)
     {
       // Do nothing
     }
 
+    std::shared_ptr<Context> context;
     ParticipantId for_participant;
     WeakNegotiatorMapPtr weak_negotiator_map;
     WeakFailureMapPtr weak_failure_map;
 
     ~Handle()
     {
+      std::lock_guard<std::recursive_mutex> lock(context->mutex);
       if (const auto map = weak_negotiator_map.lock())
         map->erase(for_participant);
 
@@ -1045,6 +1190,7 @@ public:
     NegotiatorPtr negotiator,
     std::function<void()> failure_cb)
   {
+    std::lock_guard<std::recursive_mutex> lock(context->mutex);
     const auto insertion = negotiators->insert(
       std::make_pair(for_participant, std::move(negotiator)));
 
@@ -1065,7 +1211,7 @@ public:
     }
 
     return std::make_shared<Handle>(
-      for_participant, negotiators, failure_callbacks);
+      for_participant, negotiators, failure_callbacks, context);
   }
 
   void set_retained_history_count(uint count)
@@ -1077,6 +1223,7 @@ public:
     uint64_t conflict_version,
     const std::vector<ParticipantId>& sequence) const
   {
+    std::lock_guard<std::recursive_mutex> lock(context->mutex);
     const auto negotiate_it = negotiations.find(conflict_version);
     rmf_traffic::schedule::Negotiation::ConstTablePtr table;
 
@@ -1131,6 +1278,24 @@ Negotiation::Negotiation(
       node, std::move(viewer), std::move(worker)))
 {
   // Do nothing
+}
+
+//==============================================================================
+void Negotiation::set_response_limits(
+  std::size_t max_active, std::size_t max_queued)
+{
+  _pimpl->set_response_limits(max_active, max_queued);
+}
+
+//==============================================================================
+std::optional<std::chrono::steady_clock::time_point>
+Negotiation::response_deadline(const ResponderPtr& responder)
+{
+  const auto r =
+    std::dynamic_pointer_cast<const Implementation::Responder>(responder);
+  if (r)
+    return r->deadline;
+  return std::nullopt;
 }
 
 //==============================================================================

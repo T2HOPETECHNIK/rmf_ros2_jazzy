@@ -40,7 +40,8 @@ public:
     std::shared_ptr<const rmf_traffic::agv::Planner> planner,
     const rmf_traffic::agv::Plan::StartSet& starts,
     rmf_traffic::agv::Plan::Goal goal,
-    rmf_traffic::agv::Plan::Options options);
+    rmf_traffic::agv::Plan::Options options,
+    std::shared_ptr<const void> lifetime_guard = nullptr);
 
   Planning(rmf_traffic::agv::Planner::Result _setup);
 
@@ -58,6 +59,9 @@ public:
   const rmf_traffic::agv::Planner::Result& progress() const;
 
 private:
+  // Keep admission ownership until the job's search state has been destroyed.
+  // Do not put this in Plan::Options: successful plans retain those options.
+  std::shared_ptr<const void> _lifetime_guard;
   mutable std::mutex _resume_mutex;
   std::function<void()> _resume;
   rmf_utils::optional<rmf_traffic::agv::Planner::Result> _current_result;
