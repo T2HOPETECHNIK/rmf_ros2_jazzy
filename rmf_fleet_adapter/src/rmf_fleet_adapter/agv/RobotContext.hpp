@@ -718,6 +718,13 @@ public:
   /// Retain only the mutex groups listed in the set. Release all others.
   void retain_mutex_groups(const std::unordered_set<std::string>& groups);
 
+  /// Note that a replan was skipped while this robot was waiting to lock
+  /// mutex groups, so the plan must be checked once the groups are locked.
+  void defer_replan_until_mutex_locked();
+
+  /// Returns true if a replan was deferred, and clears the deferral.
+  bool take_deferred_replan();
+
   void schedule_itinerary(
     std::shared_ptr<rmf_traffic::PlanId> plan_id,
     rmf_traffic::schedule::Itinerary itinerary);
@@ -924,6 +931,7 @@ private:
   void _handle_mutex_group_manual_release(
     const rmf_fleet_msgs::msg::MutexGroupManualRelease& msg);
   std::size_t _next_mutex_group_request_id = 0;
+  bool _replan_deferred_for_mutex = false;
   std::unordered_map<std::string, std::size_t> _mutex_group_request_owners;
   std::unordered_map<std::string, TimeMsg> _requesting_mutex_groups;
   std::unordered_map<std::string, TimeMsg> _locked_mutex_groups;

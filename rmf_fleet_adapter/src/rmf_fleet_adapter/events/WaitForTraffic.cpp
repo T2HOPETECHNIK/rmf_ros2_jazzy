@@ -17,8 +17,23 @@
 
 #include "WaitForTraffic.hpp"
 
+#include <mutex>
+#include <unordered_map>
+#include <unordered_set>
+
 namespace rmf_fleet_adapter {
 namespace events {
+
+namespace {
+//==============================================================================
+// Which participants each robot of this adapter is currently waiting for. Two
+// robots that wait for each other would otherwise sit still until the 30s
+// excessive delay replan, and replanning both at once can rebuild the cycle.
+std::mutex waiting_for_mutex;
+std::unordered_map<
+  rmf_traffic::ParticipantId,
+  std::unordered_set<rmf_traffic::ParticipantId>> waiting_for;
+} // anonymous namespace
 
 //==============================================================================
 auto WaitForTraffic::Standby::make(
@@ -219,6 +234,7 @@ auto WaitForTraffic::Active::backup() const -> Backup
 //==============================================================================
 auto WaitForTraffic::Active::interrupt(std::function<void()>) -> Resume
 {
+  _clear_waiting();
   _decision_made = std::chrono::steady_clock::now();
   // WaitForTraffic is not designed to resume after interrupting.
   // That is handled by GoToPlace.
@@ -228,6 +244,7 @@ auto WaitForTraffic::Active::interrupt(std::function<void()>) -> Resume
 //==============================================================================
 void WaitForTraffic::Active::cancel()
 {
+  _clear_waiting();
   _decision_made = std::chrono::steady_clock::now();
   _state->update_log().info("Received signal to cancel");
   _state->update_status(Status::Canceled);
@@ -237,6 +254,7 @@ void WaitForTraffic::Active::cancel()
 //==============================================================================
 void WaitForTraffic::Active::kill()
 {
+  _clear_waiting();
   _decision_made = std::chrono::steady_clock::now();
   _state->update_log().info("Received signal to kill");
   _state->update_status(Status::Killed);
@@ -271,6 +289,7 @@ void WaitForTraffic::Active::_consider_going()
 
   if (all_dependencies_reached)
   {
+    _clear_waiting();
     _decision_made = std::chrono::steady_clock::now();
     _state->update_status(Status::Completed);
     _state->update_log().info("All traffic dependencies satisfied");
@@ -279,6 +298,44 @@ void WaitForTraffic::Active::_consider_going()
       "[%s] done waiting for traffic",
       _context->requester_id().c_str());
     return _finished();
+  }
+
+  const auto me = _context->participant_id();
+  std::optional<rmf_traffic::ParticipantId> mutual;
+  {
+    std::unordered_set<rmf_traffic::ParticipantId> others;
+    for (const auto& dep : _dependencies)
+    {
+      if (!dep.reached() && !dep.deprecated())
+        others.insert(dep.dependency().on_participant);
+    }
+
+    std::lock_guard<std::mutex> lock(waiting_for_mutex);
+    for (const auto other : others)
+    {
+      const auto it = waiting_for.find(other);
+      if (it != waiting_for.end() && it->second.count(me) > 0)
+      {
+        mutual = other;
+        break;
+      }
+    }
+    waiting_for[me] = std::move(others);
+  }
+
+  // Only the robot with the higher ID replans, so the other one keeps its plan
+  // and can go once the dependency on the replaced plan is deprecated.
+  if (mutual.has_value() && me > *mutual)
+  {
+    _state->update_log().info(
+      "Replanning because of a mutual traffic wait");
+    RCLCPP_INFO(
+      _context->node()->get_logger(),
+      "Replanning for [%s] because it and participant [%lu] are waiting for "
+      "each other",
+      _context->requester_id().c_str(),
+      *mutual);
+    return _replan();
   }
 
   using namespace std::chrono_literals;
@@ -307,8 +364,22 @@ void WaitForTraffic::Active::_consider_going()
 //==============================================================================
 void WaitForTraffic::Active::_replan()
 {
+  _clear_waiting();
   _decision_made = std::chrono::steady_clock::now();
   _context->request_replan();
+}
+
+//==============================================================================
+void WaitForTraffic::Active::_clear_waiting()
+{
+  std::lock_guard<std::mutex> lock(waiting_for_mutex);
+  waiting_for.erase(_context->participant_id());
+}
+
+//==============================================================================
+WaitForTraffic::Active::~Active()
+{
+  _clear_waiting();
 }
 
 } // namespace events

@@ -126,6 +126,18 @@ void DoorOpen::ActivePhase::_init_obs()
 
           // TODO(MXG): We can stop publishing the door request once the
           // supervisor sees our request.
+          // Keep claiming the door so the context does not release it while
+          // this phase still needs it open. The context reads the claim on
+          // its worker, so make the claim there too.
+          me->_context->worker().schedule(
+            [weak](const auto&)
+            {
+              const auto me = weak.lock();
+              if (!me)
+                return;
+
+              me->_context->_hold_door(me->_door_name);
+            });
           me->_publish_open_door();
 
           const auto current_expected_finish =

@@ -110,7 +110,7 @@ void Auctioneer::Implementation::receive_response(const BidResponseMsg& msg)
 
   const auto& bid = open_bid_queue.front();
   const auto id = msg.task_id;
-  if (bid.bid_notice.task_id != id
+  if (!bid.started || bid.bid_notice.task_id != id
     || node_clock_interface->get_clock()->now() - bid.start_time
     >= bid.bid_notice.time_window)
     return;
@@ -146,6 +146,12 @@ void Auctioneer::Implementation::finish_bidding_process()
 
   if (bidding_in_process)
   {
+    // The previous auction was popped, but its winner has not acknowledged
+    // the award yet (ready_for_next_bid not called). The front task has not
+    // been announced, so do not judge its deadline. Wait for the ack.
+    if (!front_task.started)
+      return;
+
     if (determine_winner(front_task))
     {
       open_bid_queue.pop();
@@ -153,12 +159,22 @@ void Auctioneer::Implementation::finish_bidding_process()
   }
   else
   {
+    // ready_for_next_bid() can arrive twice for one auction (e.g. a no-bid
+    // failure, then a late award ack). Never restart an auction that is
+    // already running.
+    if (front_task.started)
+    {
+      bidding_in_process = true;
+      return;
+    }
+
     RCLCPP_INFO(
       node_logging_interface->get_logger(),
       " - Start new bidding task: %s",
       front_task.bid_notice.task_id.c_str());
     open_bid_queue.front().start_time =
       node_clock_interface->get_clock()->now();
+    open_bid_queue.front().started = true;
     bid_notice_pub->publish(front_task.bid_notice);
     bidding_in_process = true;
   }

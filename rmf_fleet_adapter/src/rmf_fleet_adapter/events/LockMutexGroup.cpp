@@ -280,7 +280,10 @@ void LockMutexGroup::Active::_initialize()
           self->_listener.get().unsubscribe();
           const auto now = self->_context->now();
           const auto delay = now - self->_data.hold_time;
-          if (delay > std::chrono::seconds(2))
+          // A replan deferred while waiting means lanes closed during the
+          // wait, so the plan must be checked however short the wait was.
+          const bool replan_deferred = self->_context->take_deferred_replan();
+          if (delay > std::chrono::seconds(2) || replan_deferred)
           {
             const auto start = [&]()
             -> std::optional<rmf_traffic::agv::Plan::Start>

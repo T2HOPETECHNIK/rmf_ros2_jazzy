@@ -52,6 +52,10 @@ public:
     BidNoticeMsg bid_notice;
     builtin_interfaces::msg::Time start_time;
     std::vector<bidding::Response> responses;
+    // True once the bid notice has been published. A queued bid's
+    // start_time is when it was queued, so its deadline only means
+    // something after this is set.
+    bool started = false;
   };
 
   bool bidding_in_process = false;

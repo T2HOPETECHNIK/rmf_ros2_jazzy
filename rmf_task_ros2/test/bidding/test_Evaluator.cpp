@@ -189,3 +189,60 @@ TEST_CASE("Auctioneer ignores responses outside the active auction",
   CHECK(auction.open_bid_queue.front().responses.size() == 1);
   rclcpp::shutdown(context);
 }
+
+TEST_CASE("Auctioneer waits for the award ack before the next auction",
+  "[award_ack_race]")
+{
+  const auto context = std::make_shared<rclcpp::Context>();
+  context->init(0, nullptr);
+  const auto node = rclcpp::Node::make_shared(
+    "award_ack_race", rclcpp::NodeOptions().context(context));
+  Auctioneer::Implementation auction(
+    node->get_node_base_interface(), node->get_node_clock_interface(),
+    node->get_node_logging_interface(), node->get_node_timers_interface(),
+    node->get_node_topics_interface(), node->get_node_parameters_interface(),
+    nullptr, nullptr);
+
+  BidNoticeMsg notice;
+  notice.time_window.sec = 5;
+  notice.task_id = "first";
+  auction.request_bid(notice);
+  notice.task_id = "second";
+  auction.request_bid(notice);
+
+  // "second" has been queued for longer than its time window.
+  const auto old = node->now() - rclcpp::Duration::from_seconds(60.0);
+  auction.open_bid_queue.back().start_time = old;
+
+  auction.finish_bidding_process();
+  REQUIRE(auction.open_bid_queue.front().started);
+  auction.open_bid_queue.front().start_time = old;
+  auction.finish_bidding_process();
+  REQUIRE(auction.open_bid_queue.size() == 1);
+
+  // The award for "first" is not acknowledged yet, so "second" must neither
+  // be judged against its queue time nor announced.
+  auction.finish_bidding_process();
+  auction.finish_bidding_process();
+  REQUIRE(auction.open_bid_queue.size() == 1);
+  CHECK_FALSE(auction.open_bid_queue.front().started);
+
+  // The ack arrives: "second" is announced with a fresh start time.
+  auction.bidding_in_process = false;
+  auction.finish_bidding_process();
+  REQUIRE(auction.open_bid_queue.front().started);
+  CHECK(auction.bidding_in_process);
+
+  // A duplicate ready_for_next_bid() must not restart the running auction.
+  const auto response = convert(
+    Response{std::nullopt, {"planning timed out"}}, "second");
+  auction.receive_response(response);
+  REQUIRE(auction.open_bid_queue.front().responses.size() == 1);
+  const auto started_at = rclcpp::Time(auction.open_bid_queue.front().start_time);
+  auction.bidding_in_process = false;
+  auction.finish_bidding_process();
+  CHECK(auction.bidding_in_process);
+  CHECK(rclcpp::Time(auction.open_bid_queue.front().start_time) == started_at);
+  CHECK(auction.open_bid_queue.front().responses.size() == 1);
+  rclcpp::shutdown(context);
+}

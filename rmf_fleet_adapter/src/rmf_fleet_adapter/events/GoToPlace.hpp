@@ -113,6 +113,11 @@ public:
 
     void _find_plan();
 
+    /// When no goal can be reached because of closed lanes, find the last
+    /// waypoint before the area that the first closed lane belongs to, so the
+    /// robot can wait there instead of stopping wherever it is.
+    std::optional<rmf_traffic::agv::Plan::Goal> _choose_staging_goal() const;
+
     void _execute_plan(
       rmf_traffic::PlanId plan_id,
       rmf_traffic::agv::Plan plan,
@@ -144,6 +149,9 @@ public:
     rmf_rxcpp::subscription_guard _graph_change_subscription;
 
     bool _is_interrupted = false;
+
+    // True while the chosen goal is a staging waypoint, not the real goal.
+    bool _staging = false;
   };
 };
 

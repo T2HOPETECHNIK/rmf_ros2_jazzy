@@ -172,6 +172,24 @@ TEST_CASE("Shared negotiation interface admits seven local robots safely",
     CHECK(deadlines.size() == 3);
   }
 
+  SECTION("Shared timeout timer preserves the queued response deadline")
+  {
+    // Keep both slots occupied long enough to distinguish the original deadline
+    // from an incorrectly restarted timeout when the third robot is admitted.
+    advance(650ms);
+    running[0]->forfeit({});
+    running[0].reset();
+    REQUIRE(until([&] { return running.size() == 3; }));
+    REQUIRE(deadlines[2] <= deadlines[0] + 50ms);
+
+    // Allow for the shared timer's 100 ms polling interval. A fresh 1500 ms
+    // timeout at admission would leave the third responder alive beyond this.
+    const auto stop = deadlines[2] + 350ms;
+    REQUIRE(Clock::now() < stop);
+    REQUIRE(until([&] { return forfeits == 7; }, stop - Clock::now()));
+    CHECK(running.size() == 3);
+  }
+
   SECTION("Expired queued requests never construct a responder")
   {
     REQUIRE(until([&] { return forfeits == 7; }));

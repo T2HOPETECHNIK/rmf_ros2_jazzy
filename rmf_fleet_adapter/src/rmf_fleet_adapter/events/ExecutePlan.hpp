@@ -45,7 +45,17 @@ struct ExecutePlan
   /// Check only lanes whose arrival checkpoints have not yet been reached.
   bool uses_closed_lanes(
     const std::vector<std::size_t>& closed_lanes,
-    const rmf_traffic::schedule::Participant& participant) const;
+    const rmf_traffic::schedule::Participant& participant,
+    const rmf_traffic::agv::Plan::StartSet& location = {},
+    double max_merge_waypoint_distance = 1e-3) const;
+
+  /// The lanes in closed_lanes that the plan still has to drive, skipping
+  /// lanes whose arrival checkpoints have already been reached.
+  std::vector<std::size_t> closed_lanes_ahead(
+    const std::vector<std::size_t>& closed_lanes,
+    const rmf_traffic::schedule::Participant& participant,
+    const rmf_traffic::agv::Plan::StartSet& location = {},
+    double max_merge_waypoint_distance = 1e-3) const;
 
   rmf_traffic::agv::Plan plan;
   PlanIdPtr plan_id;

@@ -21,8 +21,73 @@
 #include <rmf_traffic/schedule/StubbornNegotiator.hpp>
 #include <rmf_traffic/agv/Planner.hpp>
 
+#include <algorithm>
+#include <queue>
+#include <unordered_set>
+
 namespace rmf_fleet_adapter {
 namespace events {
+
+namespace {
+//==============================================================================
+std::unordered_set<std::string> mutex_groups_under_robot(
+  const agv::RobotContext& context)
+{
+  std::unordered_set<std::string> groups;
+
+  const bool localized = !context.location().empty()
+    || (context.lost().has_value() && context.lost()->location.has_value());
+  if (!localized)
+    return groups;
+
+  const auto& graph = context.navigation_graph();
+  const auto& map = context.map();
+  const Eigen::Vector3d p3 = context.position();
+  const Eigen::Vector2d p(p3.x(), p3.y());
+
+  double radius = 0.0;
+  if (const auto& profile = context.profile())
+  {
+    if (const auto& footprint = profile->footprint())
+      radius = footprint->get_characteristic_length();
+  }
+
+  for (std::size_t i = 0; i < graph.num_waypoints(); ++i)
+  {
+    const auto& wp = graph.get_waypoint(i);
+    const auto& group = wp.in_mutex_group();
+    if (group.empty() || wp.get_map_name() != map)
+      continue;
+
+    if ((wp.get_location() - p).norm() <= radius)
+      groups.insert(group);
+  }
+
+  for (std::size_t i = 0; i < graph.num_lanes(); ++i)
+  {
+    const auto& lane = graph.get_lane(i);
+    const auto& group = lane.properties().in_mutex_group();
+    if (group.empty() || groups.count(group) > 0)
+      continue;
+
+    const auto& wp0 = graph.get_waypoint(lane.entry().waypoint_index());
+    const auto& wp1 = graph.get_waypoint(lane.exit().waypoint_index());
+    if (wp0.get_map_name() != map || wp1.get_map_name() != map)
+      continue;
+
+    const Eigen::Vector2d a = wp0.get_location();
+    const Eigen::Vector2d b = wp1.get_location();
+    const Eigen::Vector2d ab = b - a;
+    const double len2 = ab.squaredNorm();
+    const double s = len2 > 0.0 ?
+      std::clamp((p - a).dot(ab) / len2, 0.0, 1.0) : 0.0;
+    if ((a + s*ab - p).norm() <= radius)
+      groups.insert(group);
+  }
+
+  return groups;
+}
+} // anonymous namespace
 
 //==============================================================================
 void GoToPlace::add(rmf_task_sequence::Event::Initializer& initializer)
@@ -224,9 +289,58 @@ auto GoToPlace::Active::make(
 
       if (self->_execution.has_value())
       {
-        if (self->_execution->uses_closed_lanes(
-            changes.closed_lanes, self->_context->itinerary()))
+        // Lanes the robot has already driven past do not affect it.
+        const auto nav_params = self->_context->nav_params();
+        const double merge_distance = nav_params ?
+          nav_params->max_merge_waypoint_distance : 1e-3;
+        const auto closed_ahead = self->_execution->closed_lanes_ahead(
+          changes.closed_lanes, self->_context->itinerary(),
+          self->_context->location(), merge_distance);
+        if (!closed_ahead.empty())
         {
+          const auto& requesting = self->_context->requesting_mutex_groups();
+
+          // A closed lane ahead that touches a mutex group the robot is
+          // waiting for (e.g. the lane into a lift that another robot just
+          // took) means the wait itself is for a path that has closed. That
+          // mutex may not be released for a long time, so replan now in case
+          // another route, like a different lift, is open.
+          const auto& graph = self->_context->navigation_graph();
+          const bool waiting_on_closed = std::any_of(
+            closed_ahead.begin(), closed_ahead.end(),
+            [&](const std::size_t l)
+            {
+              if (l >= graph.num_lanes())
+                return false;
+
+              const auto& lane = graph.get_lane(l);
+              for (const auto* group : {
+                  &lane.properties().in_mutex_group(),
+                  &graph.get_waypoint(lane.entry().waypoint_index())
+                  .in_mutex_group(),
+                  &graph.get_waypoint(lane.exit().waypoint_index())
+                  .in_mutex_group()})
+              {
+                if (!group->empty() && requesting.count(*group) > 0)
+                  return true;
+              }
+              return false;
+            });
+
+          if (!requesting.empty() && !waiting_on_closed)
+          {
+            // The robot is holding in place until it locks a mutex group, so
+            // there is no need to replan yet. The plan is checked against the
+            // closed lanes once the mutex groups are locked.
+            RCLCPP_INFO(
+              self->_context->node()->get_logger(),
+              "Deferring replan for [%s] around a newly closed lane until it "
+              "locks the mutex groups it is waiting for",
+              self->_context->requester_id().c_str());
+            self->_context->defer_replan_until_mutex_locked();
+            return;
+          }
+
           RCLCPP_INFO(
             self->_context->node()->get_logger(),
             "Requesting replan for [%s] to avoid a newly closed lane",
@@ -308,6 +422,10 @@ auto GoToPlace::Active::backup() const -> Backup
 auto GoToPlace::Active::interrupt(std::function<void()> task_is_interrupted)
 -> Resume
 {
+  RCLCPP_INFO(
+    _context->node()->get_logger(),
+    "Interrupting go_to_place for robot [%s]",
+    _context->requester_id().c_str());
   _negotiator->clear_license();
   _is_interrupted = true;
   _stop_and_clear();
@@ -472,6 +590,17 @@ void GoToPlace::Active::_find_plan()
   if (_is_interrupted)
     return;
 
+  // A fresh plan accounts for any lane closures whose replan was deferred.
+  _context->take_deferred_replan();
+
+  // A staging waypoint is never the event's goal. Choose again so a replan
+  // aims for the real goal, or stages again if it is still unreachable.
+  if (_staging)
+  {
+    _chosen_goal = std::nullopt;
+    _staging = false;
+  }
+
   if (!_chosen_goal.has_value() && _description.prefer_same_map())
   {
     _chosen_goal = _choose_goal(true);
@@ -482,6 +611,7 @@ void GoToPlace::Active::_find_plan()
     _chosen_goal = _choose_goal(false);
   }
 
+  _staging = false;
   if (!_chosen_goal.has_value())
   {
     std::string error_msg = "Unable to find a path to any of the goal options ["
@@ -495,8 +625,45 @@ void GoToPlace::Active::_find_plan()
       error_msg.c_str(),
       _context->requester_id().c_str());
 
-    _schedule_retry();
-    return;
+    _chosen_goal = _choose_staging_goal();
+    if (!_chosen_goal.has_value())
+    {
+      // The robot waits where it is, so it should not keep mutex groups for
+      // the path ahead (e.g. the lift lobby) that block other robots.
+      const auto& graph = _context->navigation_graph();
+      std::unordered_set<std::string> retain;
+      for (const auto& start : _context->location())
+      {
+        retain.insert(graph.get_waypoint(start.waypoint()).in_mutex_group());
+        if (start.lane().has_value())
+        {
+          const auto& lane = graph.get_lane(*start.lane());
+          retain.insert(lane.properties().in_mutex_group());
+          retain.insert(
+            graph.get_waypoint(lane.entry().waypoint_index()).in_mutex_group());
+        }
+      }
+      for (const auto& group : mutex_groups_under_robot(*_context))
+      {
+        if (_context->locked_mutex_groups().count(group) > 0)
+          retain.insert(group);
+      }
+      retain.erase("");
+      _context->retain_mutex_groups(retain);
+
+      // A replan can get here with the previous (now stopped) execution still
+      // set, and the retry does nothing while an execution exists.
+      _execution = std::nullopt;
+      _schedule_retry();
+      return;
+    }
+
+    _staging = true;
+    RCLCPP_INFO(
+      _context->node()->get_logger(),
+      "Moving [%s] to staging waypoint [%s] until a path to its goal opens",
+      _context->requester_id().c_str(),
+      wp_name(*_context, *_chosen_goal).c_str());
   }
 
   _state->update_status(Status::Underway);
@@ -563,6 +730,10 @@ void GoToPlace::Active::_find_plan()
         *result, self->_description.expected_next_destinations(),
         *self->_context->planner());
 
+      // Clear the old retry first, because _execute_plan may schedule a new
+      // one (e.g. when the robot is already at its staging waypoint).
+      self->_retry_timer = nullptr;
+
       self->_execute_plan(
         self->_context->itinerary().assign_plan_id(),
         *std::move(result),
@@ -570,7 +741,6 @@ void GoToPlace::Active::_find_plan()
         goal);
 
       self->_find_path_service = nullptr;
-      self->_retry_timer = nullptr;
     });
 
   _find_path_timeout = _context->node()->try_create_wall_timer(
@@ -588,6 +758,121 @@ void GoToPlace::Active::_find_plan()
     });
 
   _update();
+}
+
+//==============================================================================
+std::optional<rmf_traffic::agv::Plan::Goal>
+GoToPlace::Active::_choose_staging_goal() const
+{
+  const auto& starts = _context->location();
+  const auto* closures = _context->get_lane_closures();
+  if (starts.empty() || !closures)
+    return std::nullopt;
+
+  const auto& graph = _context->navigation_graph();
+  const std::size_t N = graph.num_waypoints();
+  const double inf = std::numeric_limits<double>::infinity();
+  std::vector<double> cost(N, inf);
+  std::vector<std::optional<std::size_t>> via_lane(N);
+
+  // Shortest paths over the graph, ignoring lane closures.
+  using Entry = std::pair<double, std::size_t>;
+  std::priority_queue<Entry, std::vector<Entry>, std::greater<Entry>> queue;
+  for (const auto& start : starts)
+  {
+    cost[start.waypoint()] = 0.0;
+    queue.push({0.0, start.waypoint()});
+  }
+
+  while (!queue.empty())
+  {
+    const auto [c, wp] = queue.top();
+    queue.pop();
+    if (c > cost[wp])
+      continue;
+
+    const Eigen::Vector2d p0 = graph.get_waypoint(wp).get_location();
+    for (const auto lane_index : graph.lanes_from(wp))
+    {
+      const auto next = graph.get_lane(lane_index).exit().waypoint_index();
+      const Eigen::Vector2d p1 = graph.get_waypoint(next).get_location();
+      const double next_cost = c + (p1 - p0).norm();
+      if (next_cost < cost[next])
+      {
+        cost[next] = next_cost;
+        via_lane[next] = lane_index;
+        queue.push({next_cost, next});
+      }
+    }
+  }
+
+  std::optional<std::size_t> goal_wp;
+  for (const auto& option : _description.one_of())
+  {
+    const auto wp = option.waypoint();
+    if (wp < N && cost[wp] < inf && (!goal_wp || cost[wp] < cost[*goal_wp]))
+      goal_wp = wp;
+  }
+
+  if (!goal_wp.has_value())
+    return std::nullopt;
+
+  // Waypoints from the start to the goal
+  std::vector<std::size_t> path_wps = {*goal_wp};
+  std::vector<std::size_t> path_lanes;
+  while (via_lane[path_wps.back()].has_value())
+  {
+    const auto lane = *via_lane[path_wps.back()];
+    path_lanes.push_back(lane);
+    path_wps.push_back(graph.get_lane(lane).entry().waypoint_index());
+  }
+  std::reverse(path_wps.begin(), path_wps.end());
+  std::reverse(path_lanes.begin(), path_lanes.end());
+
+  // The lane i connects path_wps[i] to path_wps[i+1]
+  std::optional<std::size_t> blocked;
+  for (std::size_t i = 0; i < path_lanes.size(); ++i)
+  {
+    if (closures->is_closed(path_lanes[i]))
+    {
+      blocked = i;
+      break;
+    }
+  }
+
+  if (!blocked.has_value())
+    return std::nullopt;
+
+  std::size_t stage = *blocked;
+
+  // A plan cannot end inside a lift cabin, so wait outside the lift instead.
+  // Do this first so the mutex group below is the one outside the cabin.
+  while (stage > 0 && graph.get_waypoint(path_wps[stage]).in_lift())
+    --stage;
+
+  // Stop before entering the mutex group of the waypoint in front of the
+  // closed lane, e.g. outside the lift lobby, so the robot does not block it.
+  const auto& group = graph.get_waypoint(path_wps[stage]).in_mutex_group();
+  if (!group.empty())
+  {
+    while (stage > 0
+      && graph.get_waypoint(path_wps[stage - 1]).in_mutex_group() == group)
+    {
+      --stage;
+    }
+
+    if (stage == 0)
+      return std::nullopt;
+
+    --stage;
+  }
+
+  // Backing out of the group can land in a cabin the path rode earlier. Do not
+  // stage there, and do not back into another group either.
+  if (stage == 0 || graph.get_waypoint(path_wps[stage]).in_lift())
+    return std::nullopt;
+
+  return rmf_traffic::agv::Plan::Goal(path_wps[stage]);
 }
 
 //==============================================================================
@@ -630,6 +915,15 @@ void GoToPlace::Active::_execute_plan(
   if (_is_interrupted)
     return;
 
+  if (_staging && (plan.get_itinerary().empty() || plan.get_waypoints().empty()))
+  {
+    // Already at the staging waypoint. Keep waiting for the goal to open.
+    _chosen_goal = std::nullopt;
+    _staging = false;
+    _schedule_retry();
+    return;
+  }
+
   if (plan.get_itinerary().empty() || plan.get_waypoints().empty())
   {
     _state->update_status(Status::Completed);
@@ -658,10 +952,44 @@ void GoToPlace::Active::_execute_plan(
     .name_or_index().c_str(),
     _context->requester_id().c_str());
 
+  auto finished = _finished;
+  if (_staging)
+  {
+    // Reaching the staging waypoint does not finish this event. Try to plan
+    // to the real goal again from there.
+    finished = [w = weak_from_this()]()
+      {
+        const auto self = w.lock();
+        if (!self)
+          return;
+
+        self->_context->worker().schedule(
+          [w](const auto&)
+          {
+            const auto self = w.lock();
+            if (!self)
+              return;
+
+            self->_execution = std::nullopt;
+            self->_chosen_goal = std::nullopt;
+            self->_staging = false;
+
+            // The staging execution shares this event's state and marked it
+            // completed, but the event is still waiting for its real goal.
+            self->_state->update_status(Status::Underway);
+            self->_state->update_log().info(
+              "Reached the staging waypoint. Waiting for a path to the goal.");
+            self->_update();
+
+            self->_find_plan();
+          });
+      };
+  }
+
   _execution = ExecutePlan::make(
     _context, plan_id, std::move(plan), std::move(goal),
     std::move(full_itinerary),
-    _assign_id, _state, _update, _finished, _tail_period);
+    _assign_id, _state, _update, std::move(finished), _tail_period);
 
   if (!_execution.has_value())
   {
