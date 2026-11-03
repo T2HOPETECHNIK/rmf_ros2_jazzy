@@ -162,6 +162,18 @@ public:
           *node, mirror_manager.view(),
           std::make_shared<WorkerWrapper>(worker));
 
+        const auto active_limit = node->declare_parameter<int>(
+          "negotiation_max_active_services", 4);
+        const auto queued_limit = node->declare_parameter<int>(
+          "negotiation_max_queued_requests", 32);
+        if (active_limit <= 0 || queued_limit <= 0)
+          throw std::invalid_argument("Negotiation limits must be positive");
+        negotiation->set_response_limits(active_limit, queued_limit);
+        RCLCPP_INFO(node->get_logger(),
+          "Negotiation planning limit: %zu active services, %zu queued requests",
+          static_cast<std::size_t>(active_limit),
+          static_cast<std::size_t>(queued_limit));
+
         return rmf_utils::make_unique_impl<Implementation>(
           worker,
           std::move(node),
@@ -561,7 +573,7 @@ Adapter& Adapter::wait_for(std::chrono::nanoseconds max_wait)
     lock, wait_until_time, [&]()
     {
       return !_pimpl->node->still_spinning()
-      && std::chrono::steady_clock::now() < wait_until_time;
+        && std::chrono::steady_clock::now() < wait_until_time;
     });
 
   return *this;

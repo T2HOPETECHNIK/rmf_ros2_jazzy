@@ -25,8 +25,10 @@ Planning::Planning(
   std::shared_ptr<const rmf_traffic::agv::Planner> planner,
   const rmf_traffic::agv::Plan::StartSet& starts,
   rmf_traffic::agv::Plan::Goal goal,
-  rmf_traffic::agv::Plan::Options options)
-: _current_result(planner->setup(starts, std::move(goal), std::move(options)))
+  rmf_traffic::agv::Plan::Options options,
+  std::shared_ptr<const void> lifetime_guard)
+: _lifetime_guard(std::move(lifetime_guard)),
+  _current_result(planner->setup(starts, std::move(goal), std::move(options)))
 {
   _current_result->options().saturation_limit(10000);
 }

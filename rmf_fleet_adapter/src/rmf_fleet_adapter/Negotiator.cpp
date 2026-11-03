@@ -16,6 +16,7 @@
 */
 
 #include "Negotiator.hpp"
+#include <rmf_traffic_ros2/schedule/Negotiation.hpp>
 
 namespace rmf_fleet_adapter {
 
@@ -37,6 +38,15 @@ void Negotiator::respond(
   const TableViewerPtr& table_viewer,
   const ResponderPtr& responder)
 {
+  using Clock = std::chrono::steady_clock;
+  const auto deadline =
+    rmf_traffic_ros2::schedule::Negotiation::response_deadline(responder);
+  if (deadline && Clock::now() >= *deadline)
+  {
+    responder->forfeit({});
+    return;
+  }
+
   auto service = _respond(table_viewer, responder);
   if (!service)
   {
@@ -68,14 +78,28 @@ void Negotiator::respond(
     });
 
   using namespace std::chrono_literals;
-  const auto wait_duration = 2s + table_viewer->sequence().back().version * 10s;
-  auto negotiation_timer = _context->node()->try_create_wall_timer(
-    wait_duration,
-    [s = service->weak_from_this()]
-    {
-      if (const auto service = s.lock())
-        service->interrupt();
-    });
+  auto wait_duration = std::chrono::duration_cast<Clock::duration>(
+    2s + table_viewer->sequence().back().version * 10s);
+  if (deadline)
+  {
+    // Reserve time for the result to reach the worker and publish its response.
+    wait_duration = std::min(wait_duration, *deadline - Clock::now() - 100ms);
+  }
+  rclcpp::TimerBase::SharedPtr negotiation_timer;
+  if (wait_duration <= Clock::duration::zero())
+  {
+    service->interrupt();
+  }
+  else
+  {
+    negotiation_timer = _context->node()->try_create_wall_timer(
+      wait_duration,
+      [s = service->weak_from_this()]
+      {
+        if (const auto service = s.lock())
+          service->interrupt();
+      });
+  }
 
   _negotiate_services[service] = NegotiationManagers{
     std::move(negotiate_sub),

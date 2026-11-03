@@ -19,6 +19,8 @@
 #define RMF_TRAFFIC_ROS2__SCHEDULE__NEGOTIATION_HPP
 
 #include <rclcpp/node.hpp>
+#include <chrono>
+#include <optional>
 
 #include <rmf_traffic/schedule/Negotiator.hpp>
 #include <rmf_traffic/schedule/Participant.hpp>
@@ -70,6 +72,16 @@ public:
 
   using TableViewPtr = rmf_traffic::schedule::Negotiation::Table::ViewerPtr;
   using ResponderPtr = rmf_traffic::schedule::Negotiator::ResponderPtr;
+  /// Bound asynchronous response construction across all local participants.
+  /// Call once before receiving notices. Both limits must be positive. Requests
+  /// expire using timeout_duration(), including time spent waiting in the queue.
+  /// Without this call the historical unlimited behavior is retained.
+  void set_response_limits(std::size_t max_active, std::size_t max_queued);
+
+  /// Absolute response deadline, when the responder belongs to this interface.
+  static std::optional<std::chrono::steady_clock::time_point> response_deadline(
+    const ResponderPtr& responder);
+
   using StatusUpdateCallback =
     std::function<void (uint64_t conflict_version, TableViewPtr table_view)>;
 
