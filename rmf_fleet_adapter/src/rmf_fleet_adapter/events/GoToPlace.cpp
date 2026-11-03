@@ -28,6 +28,61 @@
 namespace rmf_fleet_adapter {
 namespace events {
 
+namespace {
+//==============================================================================
+std::unordered_set<std::string> mutex_groups_under_robot(
+  const agv::RobotContext& context)
+{
+  std::unordered_set<std::string> groups;
+  const auto& graph = context.navigation_graph();
+  const auto& map = context.map();
+  const Eigen::Vector3d p3 = context.position();
+  const Eigen::Vector2d p(p3.x(), p3.y());
+
+  double radius = 0.0;
+  if (const auto& profile = context.profile())
+  {
+    if (const auto& footprint = profile->footprint())
+      radius = footprint->get_characteristic_length();
+  }
+
+  for (std::size_t i = 0; i < graph.num_waypoints(); ++i)
+  {
+    const auto& wp = graph.get_waypoint(i);
+    const auto& group = wp.in_mutex_group();
+    if (group.empty() || wp.get_map_name() != map)
+      continue;
+
+    if ((wp.get_location() - p).norm() <= radius)
+      groups.insert(group);
+  }
+
+  for (std::size_t i = 0; i < graph.num_lanes(); ++i)
+  {
+    const auto& lane = graph.get_lane(i);
+    const auto& group = lane.properties().in_mutex_group();
+    if (group.empty() || groups.count(group) > 0)
+      continue;
+
+    const auto& wp0 = graph.get_waypoint(lane.entry().waypoint_index());
+    const auto& wp1 = graph.get_waypoint(lane.exit().waypoint_index());
+    if (wp0.get_map_name() != map || wp1.get_map_name() != map)
+      continue;
+
+    const Eigen::Vector2d a = wp0.get_location();
+    const Eigen::Vector2d b = wp1.get_location();
+    const Eigen::Vector2d ab = b - a;
+    const double len2 = ab.squaredNorm();
+    const double s = len2 > 0.0 ?
+      std::clamp((p - a).dot(ab) / len2, 0.0, 1.0) : 0.0;
+    if ((a + s*ab - p).norm() <= radius)
+      groups.insert(group);
+  }
+
+  return groups;
+}
+} // anonymous namespace
+
 //==============================================================================
 void GoToPlace::add(rmf_task_sequence::Event::Initializer& initializer)
 {
@@ -581,6 +636,11 @@ void GoToPlace::Active::_find_plan()
           retain.insert(
             graph.get_waypoint(lane.entry().waypoint_index()).in_mutex_group());
         }
+      }
+      for (const auto& group : mutex_groups_under_robot(*_context))
+      {
+        if (_context->locked_mutex_groups().count(group) > 0)
+          retain.insert(group);
       }
       retain.erase("");
       _context->retain_mutex_groups(retain);
