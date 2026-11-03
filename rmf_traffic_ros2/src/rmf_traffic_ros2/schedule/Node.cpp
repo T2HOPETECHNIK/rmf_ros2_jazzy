@@ -257,10 +257,15 @@ std::size_t waypoints_until(
 }
 
 //==============================================================================
+// The part of a trajectory from the given time onwards; nullopt once it has
+// finished. extra_waypoint is set when the first waypoint was added by the crop
+// rather than taken from the original trajectory.
 std::optional<rmf_traffic::Trajectory> trajectory_from(
   const rmf_traffic::Trajectory& trajectory,
-  const rmf_traffic::Time time)
+  const rmf_traffic::Time time,
+  bool& extra_waypoint)
 {
+  extra_waypoint = false;
   const auto* start = trajectory.start_time();
   const auto* finish = trajectory.finish_time();
   if (!start || !finish || *finish <= time)
@@ -274,7 +279,9 @@ std::optional<rmf_traffic::Trajectory> trajectory_from(
   cropped.insert(
     time, motion->compute_position(time), motion->compute_velocity(time));
 
-  for (auto it = trajectory.lower_bound(time); it != trajectory.end(); ++it)
+  const auto first = trajectory.lower_bound(time);
+  extra_waypoint = first == trajectory.end() || first->time() != time;
+  for (auto it = first; it != trajectory.end(); ++it)
   {
     if (it->time() > time)
       cropped.insert(*it);
@@ -347,10 +354,12 @@ ConflictKind classify_route_pair(
   // check again using only the remaining part of each trajectory.
   std::optional<rmf_traffic::Trajectory> future_a;
   std::optional<rmf_traffic::Trajectory> future_b;
+  bool extra_a = false;
+  bool extra_b = false;
   if (found_conflict->time < filter.now)
   {
-    future_a = trajectory_from(*traj_a, filter.now);
-    future_b = trajectory_from(*traj_b, filter.now);
+    future_a = trajectory_from(*traj_a, filter.now, extra_a);
+    future_b = trajectory_from(*traj_b, filter.now, extra_b);
     if (!future_a.has_value() || !future_b.has_value())
       return ConflictKind::None;
 
@@ -378,10 +387,14 @@ ConflictKind classify_route_pair(
     if (time_until_conflict > *filter.horizon)
     {
       // DetectConflict was given route_b first, so a_it belongs to route_b.
-      const auto free_b = waypoints_until(
-        *traj_b, found_conflict->a_it, filter.now);
-      const auto free_a = waypoints_until(
-        *traj_a, found_conflict->b_it, filter.now);
+      // A waypoint added by cropping is not part of the real route, so leave
+      // it out of the count.
+      const auto uncount = [](std::size_t n, bool extra)
+        { return extra && n > 0 ? n - 1 : n; };
+      const auto free_b = uncount(waypoints_until(
+        *traj_b, found_conflict->a_it, filter.now), extra_b);
+      const auto free_a = uncount(waypoints_until(
+        *traj_a, found_conflict->b_it, filter.now), extra_a);
 
       if (free_a > filter.min_free_waypoints
         && free_b > filter.min_free_waypoints)
