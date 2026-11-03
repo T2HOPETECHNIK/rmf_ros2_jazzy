@@ -34,6 +34,12 @@ std::unordered_set<std::string> mutex_groups_under_robot(
   const agv::RobotContext& context)
 {
   std::unordered_set<std::string> groups;
+
+  const bool localized = !context.location().empty()
+    || (context.lost().has_value() && context.lost()->location.has_value());
+  if (!localized)
+    return groups;
+
   const auto& graph = context.navigation_graph();
   const auto& map = context.map();
   const Eigen::Vector3d p3 = context.position();
