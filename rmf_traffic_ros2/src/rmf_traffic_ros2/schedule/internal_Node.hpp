@@ -308,6 +308,10 @@ public:
   rclcpp::Subscription<BuildingMap>::SharedPtr building_map_sub;
   
   std::optional<rmf_traffic::Duration> max_negotiation_duration;
+  // Trajectories that finished more than this long ago are culled. Every
+  // full-schedule scan (conflict checks, mirror updates) costs more the more
+  // history is kept. Set by [schedule_history_sec].
+  rmf_traffic::Duration schedule_history = std::chrono::minutes(10);
   
   using ConflictAck = rmf_traffic_msgs::msg::NegotiationAck;
   using ConflictAckSub = rclcpp::Subscription<ConflictAck>;
