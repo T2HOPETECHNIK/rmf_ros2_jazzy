@@ -384,6 +384,11 @@ public:
   rclcpp::TimerBase::SharedPtr memory_utilization_timer;
   std::optional<std::size_t> planner_cache_reset_size;
 
+  // Upper bound on time spent planning one allocation (bid or reassignment).
+  // Set by the ROS parameter [task_planning_time_limit] in seconds.
+  std::chrono::steady_clock::duration task_planning_time_limit =
+    std::chrono::seconds(10);
+
   template<typename... Args>
   static std::shared_ptr<FleetUpdateHandle> make(Args&&... args)
   {
@@ -396,6 +401,48 @@ public:
       rxcpp::schedulers::make_new_thread().create_worker();
 
     handle->_pimpl->add_standard_tasks();
+
+    {
+      // Several fleets may share one node, so only declare the parameter once.
+      // Dynamic typing accepts both 40 and 40.0 from launch files.
+      const std::string name = "task_planning_time_limit";
+      auto& n = *handle->_pimpl->node;
+      if (!n.has_parameter(name))
+      {
+        rcl_interfaces::msg::ParameterDescriptor desc;
+        desc.dynamic_typing = true;
+        desc.description =
+          "Maximum seconds to spend planning one task allocation. Bids are "
+          "also bounded by the dispatcher's bidding_time_window.";
+        n.declare_parameter(name, rclcpp::ParameterValue(10.0), desc);
+      }
+      const auto value = n.get_parameter(name);
+      double seconds = 10.0;
+      if (value.get_type() == rclcpp::ParameterType::PARAMETER_DOUBLE)
+        seconds = value.as_double();
+      else if (value.get_type() == rclcpp::ParameterType::PARAMETER_INTEGER)
+        seconds = static_cast<double>(value.as_int());
+      else
+        RCLCPP_ERROR(
+          n.get_logger(),
+          "Parameter [%s] must be a number; using 10 seconds", name.c_str());
+
+      if (seconds <= 0.0)
+      {
+        RCLCPP_ERROR(
+          n.get_logger(),
+          "Parameter [%s] must be positive (got %f); using 10 seconds",
+          name.c_str(), seconds);
+        seconds = 10.0;
+      }
+
+      handle->_pimpl->task_planning_time_limit =
+        std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+        std::chrono::duration<double>(seconds));
+      RCLCPP_INFO(
+        n.get_logger(),
+        "Parameter [%s] set to: %f seconds", name.c_str(), seconds);
+    }
 
     handle->_pimpl->emergency_obs =
       handle->_pimpl->emergency_publisher.get_observable();

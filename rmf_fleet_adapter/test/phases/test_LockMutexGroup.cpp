@@ -287,6 +287,9 @@ TEST_CASE("Bid deadlines include queueing and reserve publication time",
   CHECK_FALSE(BidDeadline(received, -1s).can_respond(received));
   CHECK(BidDeadline(received, 100ms).planning_deadline() == received + 50ms);
   CHECK(BidDeadline(received, 60s).planning_deadline() == received + 10s);
+  // Configurable planning limit, still bounded by the response margin.
+  CHECK(BidDeadline(received, 60s, 30s).planning_deadline() == received + 30s);
+  CHECK(BidDeadline(received, 40s, 60s).planning_deadline() == received + 39s);
 }
 
 TEST_CASE_METHOD(MockAdapterFixture,

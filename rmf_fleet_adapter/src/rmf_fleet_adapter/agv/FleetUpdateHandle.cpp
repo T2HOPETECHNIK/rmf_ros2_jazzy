@@ -333,7 +333,7 @@ public:
     auto options = task_planner.default_options();
     services::TaskPlanningDeadline deadline(
       planning_deadline.value_or(
-        services::TaskPlanningDeadline::Clock::now() + std::chrono::seconds(10)),
+        services::TaskPlanningDeadline::Clock::now() + planning_time_limit),
       [previous = options.interrupter(), cancelled]()
       {
         return (previous && previous()) || (cancelled && cancelled());
@@ -484,8 +484,10 @@ public:
   }
 
   // Bids carry an absolute deadline from receipt. Reassignments have no auction
-  // window and instead receive a ten-second budget when execution starts.
+  // window and instead receive planning_time_limit when execution starts.
   std::optional<services::TaskPlanningDeadline::Clock::time_point> planning_deadline;
+  services::TaskPlanningDeadline::Clock::duration planning_time_limit =
+    std::chrono::seconds(10);
   rmf_task::ConstRequestPtr new_request;
   Expectations expect;
   rmf_task::TaskPlanner task_planner;
@@ -500,7 +502,8 @@ void FleetUpdateHandle::Implementation::bid_notice_cb(
   const services::BidDeadline bid_deadline(
     services::BidDeadline::Clock::now(),
     std::chrono::seconds(bid_notice.time_window.sec)
-    + std::chrono::nanoseconds(bid_notice.time_window.nanosec));
+    + std::chrono::nanoseconds(bid_notice.time_window.nanosec),
+    task_planning_time_limit);
   const auto respond = [callback = std::move(respond_callback), bid_deadline](
     const rmf_task_ros2::bidding::Response& response)
     {
@@ -604,6 +607,7 @@ void FleetUpdateHandle::Implementation::bid_notice_cb(
     *task_planner,
     node);
   calculate_bid->planning_deadline = bid_deadline.planning_deadline();
+  calculate_bid->planning_time_limit = task_planning_time_limit;
 
   auto receive_allocation = [w = weak_self, respond, task_id, bid_deadline](
     AllocateTasks::Result result)
@@ -1140,13 +1144,14 @@ void FleetUpdateHandle::Implementation::reassign_dispatched_tasks(
       expectations = std::move(expectations),
       task_planner = *task_planner,
       node = node,
-      worker = worker
+      worker = worker,
+      planning_time_limit = task_planning_time_limit
     ](const auto&)
     {
       std::vector<std::string> errors;
-      const auto replan_results = AllocateTasks(
-        nullptr, expectations, task_planner, node)
-      .run(errors);
+      AllocateTasks allocate(nullptr, expectations, task_planner, node);
+      allocate.planning_time_limit = planning_time_limit;
+      const auto replan_results = allocate.run(errors);
 
       if (replan_results.has_value())
       {

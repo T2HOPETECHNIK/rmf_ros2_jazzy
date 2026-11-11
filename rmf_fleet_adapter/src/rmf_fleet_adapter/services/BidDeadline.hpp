@@ -29,7 +29,10 @@ class BidDeadline
 public:
   using Clock = std::chrono::steady_clock;
 
-  BidDeadline(Clock::time_point received, Clock::duration window)
+  BidDeadline(
+    Clock::time_point received,
+    Clock::duration window,
+    Clock::duration planning_time_limit = std::chrono::seconds(10))
   {
     window = std::max(window, Clock::duration::zero());
     // Reserve up to 500ms each for result processing and response transport.
@@ -37,7 +40,7 @@ public:
     const auto margin = std::min<Clock::duration>(
       std::chrono::milliseconds(500), window / 4);
     _response = received + window - margin;
-    _planning = std::min(received + std::chrono::seconds(10), _response - margin);
+    _planning = std::min(received + planning_time_limit, _response - margin);
     // BidNotice does not carry the auctioneer's start time. These margins are
     // best effort; the auctioneer must also reject late responses safely.
   }
