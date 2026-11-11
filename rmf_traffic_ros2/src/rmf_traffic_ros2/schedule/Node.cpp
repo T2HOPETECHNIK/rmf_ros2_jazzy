@@ -611,6 +611,26 @@ ScheduleNode::ScheduleNode(
       rmf_traffic::time::from_seconds(max_negotiation_sec);
   }
 
+  // How long finished trajectories stay in the schedule before cull() drops
+  // them. Upstream kept 2 h; past trajectories are not needed for conflicts or
+  // mirrors, and every full-schedule scan grows with them.
+  const double history_sec =
+    declare_parameter<double>("schedule_history_sec", 600.0);
+  if (history_sec > 0.0)
+  {
+    schedule_history = rmf_traffic::time::from_seconds(history_sec);
+  }
+  else
+  {
+    RCLCPP_ERROR(
+      get_logger(),
+      "Parameter [schedule_history_sec] must be positive (got %f); "
+      "using 600 seconds", history_sec);
+  }
+  RCLCPP_INFO(
+    get_logger(), "Schedule history kept for [%.1fs] after a trajectory ends",
+    rmf_traffic::time::to_seconds(schedule_history));
+
   const std::string horizon_str = conflict_horizon.has_value() ?
     std::to_string(horizon_sec) + "s" : "disabled";
   RCLCPP_INFO(
@@ -1512,7 +1532,7 @@ void ScheduleNode::cull()
     // Cull unnecessary data from the schedule
     std::lock_guard<std::mutex> lock(database_mutex);
     database->set_current_time(time);
-    database->cull(time - std::chrono::hours(2));
+    database->cull(time - schedule_history);
   }
 
   cull_negotiations();
