@@ -726,7 +726,25 @@ PYBIND11_MODULE(rmf_adapter, m) {
     {
       rclcpp::Parameter param("use_sim_time", true);
       self.set_parameter(param);
-    });
+    })
+  .def("task_planning_time_limit", [](rclcpp::Node& self, double seconds)
+    {
+      // Read by the fleet when it is created, so call this before adding one.
+      // rclcpp::init gets no ROS args here, so launch params cannot reach
+      // this node directly.
+      const std::string name = "task_planning_time_limit";
+      if (!self.has_parameter(name))
+      {
+        rcl_interfaces::msg::ParameterDescriptor desc;
+        desc.dynamic_typing = true;
+        self.declare_parameter(name, rclcpp::ParameterValue(seconds), desc);
+      }
+      else
+      {
+        self.set_parameter(rclcpp::Parameter(name, seconds));
+      }
+    },
+    py::arg("seconds"));
 
   // Python rclcpp init and spin call
   m.def("init_rclcpp", []() { rclcpp::init(0, nullptr); });
